@@ -534,6 +534,8 @@ if "generated_files" not in st.session_state:
 # We persist the NetSuite→Tabs ID cache to disk and hydrate it at startup.
 _CACHE_DIR = os.path.join(OUTPUT_DIR, "_session")
 _NS_CACHE_FILE = os.path.join(_CACHE_DIR, "ns_to_tabs_cache.json")
+# Try repo root first (for deployment), then fall back to cache dir
+_CLIENT_MAPPINGS_FILE_REPO = os.path.join(os.path.dirname(__file__), "client_mappings.json")
 _CLIENT_MAPPINGS_FILE = os.path.join(_CACHE_DIR, "client_mappings.json")
 
 def _ensure_cache_dir_exists() -> None:
@@ -564,24 +566,28 @@ def _save_ns_cache_to_disk(cache: dict) -> None:
         pass
 
 def _load_client_mappings_from_disk() -> dict:
-    """Load client mappings (parent_to_id, acct_to_tabs_id, etc.) from disk"""
-    try:
-        if os.path.exists(_CLIENT_MAPPINGS_FILE):
-            import json
-            with open(_CLIENT_MAPPINGS_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                if isinstance(data, dict):
-                    return {
-                        "parent_to_id": {str(k): str(v) for k, v in data.get("parent_to_id", {}).items()},
-                        "acct_to_tabs_id": {str(k): str(v) for k, v in data.get("acct_to_tabs_id", {}).items()},
-                        "acct_to_ns_id": {str(k): str(v) for k, v in data.get("acct_to_ns_id", {}).items()},
-                        "acct_to_income_evt": {str(k): str(v) for k, v in data.get("acct_to_income_evt", {}).items()},
-                        "acct_to_lbpa_evt": {str(k): str(v) for k, v in data.get("acct_to_lbpa_evt", {}).items()},
-                        "acct_to_diff_name": {str(k): str(v) for k, v in data.get("acct_to_diff_name", {}).items()},
-                        "acct_to_base_name": {str(k): str(v) for k, v in data.get("acct_to_base_name", {}).items()},
-                    }
-    except Exception:
-        pass
+    """Load client mappings (parent_to_id, acct_to_tabs_id, etc.) from disk
+    Tries repo root first (for deployment), then cache directory
+    """
+    import json
+    # Try repo root first (for Streamlit Cloud deployment)
+    for file_path in [_CLIENT_MAPPINGS_FILE_REPO, _CLIENT_MAPPINGS_FILE]:
+        try:
+            if os.path.exists(file_path):
+                with open(file_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, dict):
+                        return {
+                            "parent_to_id": {str(k): str(v) for k, v in data.get("parent_to_id", {}).items()},
+                            "acct_to_tabs_id": {str(k): str(v) for k, v in data.get("acct_to_tabs_id", {}).items()},
+                            "acct_to_ns_id": {str(k): str(v) for k, v in data.get("acct_to_ns_id", {}).items()},
+                            "acct_to_income_evt": {str(k): str(v) for k, v in data.get("acct_to_income_evt", {}).items()},
+                            "acct_to_lbpa_evt": {str(k): str(v) for k, v in data.get("acct_to_lbpa_evt", {}).items()},
+                            "acct_to_diff_name": {str(k): str(v) for k, v in data.get("acct_to_diff_name", {}).items()},
+                            "acct_to_base_name": {str(k): str(v) for k, v in data.get("acct_to_base_name", {}).items()},
+                        }
+        except Exception:
+            continue
     return {}
 
 def _save_client_mappings_to_disk(mappings: dict) -> None:

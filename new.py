@@ -748,6 +748,8 @@ def resolve_tabs_id_from_ns(ns_external_id: str) -> str | None:
                     if tabs_id:
                         cache[ns_external_id] = tabs_id
                         st.session_state["ns_to_tabs_cache"] = cache
+                        # Persist to disk
+                        _save_ns_cache_to_disk(cache)
                         return tabs_id
             # Fallback: first item when search hits
             cust = items[0]
@@ -755,6 +757,8 @@ def resolve_tabs_id_from_ns(ns_external_id: str) -> str | None:
             if tabs_id:
                 cache[ns_external_id] = tabs_id
                 st.session_state["ns_to_tabs_cache"] = cache
+                # Persist to disk
+                _save_ns_cache_to_disk(cache)
                 return tabs_id
         except Exception:
             continue

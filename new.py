@@ -1575,7 +1575,6 @@ with usage_tab:
                 st.error(f"Could not preview LBPA file: {e}")
 
     # Client mappings are automatically loaded from disk at startup
-    # Show mappings status
     current_mappings = st.session_state.get("client_mappings", {})
     if not current_mappings:
         # Try to load from disk if not in session state
@@ -1583,12 +1582,6 @@ with usage_tab:
         if disk_mappings:
             st.session_state["client_mappings"] = disk_mappings
             current_mappings = disk_mappings
-    
-    if current_mappings and current_mappings.get("acct_to_ns_id"):
-        mapping_count = len(current_mappings.get("acct_to_ns_id", {}))
-        st.info(f"✅ Client mappings loaded ({mapping_count} NetSuite ID mappings available)")
-    else:
-        st.warning("⚠️ No client mappings found. Please ensure client_mappings.json exists in usage_uploads/_session/")
 
     resolve_now = st.checkbox("Retrieve Tabs Customer IDs (requires API key)")
     if resolve_now:

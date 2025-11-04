@@ -1006,6 +1006,10 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_clients=None, resol
 
     income_df = pd.read_csv(uploaded_income)
     lbpa_df = pd.read_csv(uploaded_lbpa)
+    
+    # Debug: Track Income and LBPA rows before processing
+    income_initial_count = len(income_df)
+    lbpa_initial_count = len(lbpa_df)
 
     income_upload = process_usage(income_df, "Per Application",
                                   ["isinitialsubmission", "perapplication", "applicationcount"])
@@ -1017,11 +1021,13 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_clients=None, resol
     lbpa_upload = process_usage(lbpa_df, "Units",
                                 ["unitsaspersubmission", "units", "unitcount"])
     lbpa_upload["ApplicationTypeName"] = "LBPA"
+    
     if acct_to_lbpa_evt:
         lbpa_upload["event_type_name"] = lbpa_upload["account_id"].map(acct_to_lbpa_evt).fillna(lbpa_upload["event_type_name"])
 
     # Final combined usage (internal dataframe with account_id)
     combined_internal = pd.concat([income_upload, lbpa_upload], ignore_index=True)
+    
 
     # Map event_type_name based on ApplicationTypeName
     # Income: "Per Application" -> "app", "Units" -> "unit"
@@ -1267,6 +1273,59 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_clients=None, resol
         mapped_apps = combined_internal.loc[valid_customer_mask, "__group_key__"].map(customer_app_sums).fillna(0)
         combined_internal.loc[valid_customer_mask, "IsInitialSubmission"] = mapped_apps
     
+    # For rows with missing customer_id, calculate sums by account_id instead
+    # Sum ALL rows from original Income and LBPA files by account_id (not just ones without customer_id)
+    missing_customer_mask = ~valid_customer_mask
+    if missing_customer_mask.any() and "account_id" in combined_internal.columns:
+        # Create account_id to sum mappings for missing customer_id rows
+        account_units_sums = {}
+        account_app_sums = {}
+        
+        # Sum from Income file by account_id (ALL rows, not filtered by customer_id)
+        if "UnitsAsPerSubmission" in income_df.columns and "AccountID" in income_df.columns:
+            income_account_groups = income_df["AccountID"].astype(str).str.replace(r"[^0-9]", "", regex=True)
+            income_df["UnitsAsPerSubmission"] = pd.to_numeric(income_df["UnitsAsPerSubmission"], errors="coerce").fillna(0)
+            income_units_by_account = income_df.groupby(income_account_groups)["UnitsAsPerSubmission"].sum()
+            for account_id, value in income_units_by_account.items():
+                if account_id:
+                    account_units_sums[account_id] = account_units_sums.get(account_id, 0) + value
+        
+        if "IsInitialSubmission" in income_df.columns and "AccountID" in income_df.columns:
+            income_account_groups = income_df["AccountID"].astype(str).str.replace(r"[^0-9]", "", regex=True)
+            income_df["IsInitialSubmission"] = pd.to_numeric(income_df["IsInitialSubmission"], errors="coerce").fillna(0)
+            income_apps_by_account = income_df.groupby(income_account_groups)["IsInitialSubmission"].sum()
+            for account_id, value in income_apps_by_account.items():
+                if account_id:
+                    account_app_sums[account_id] = account_app_sums.get(account_id, 0) + value
+        
+        # Sum from LBPA file by account_id (ALL rows, not filtered by customer_id)
+        if "UnitsAsPerSubmission" in lbpa_df.columns and "AccountID" in lbpa_df.columns:
+            lbpa_account_groups = lbpa_df["AccountID"].astype(str).str.replace(r"[^0-9]", "", regex=True)
+            lbpa_df["UnitsAsPerSubmission"] = pd.to_numeric(lbpa_df["UnitsAsPerSubmission"], errors="coerce").fillna(0)
+            lbpa_units_by_account = lbpa_df.groupby(lbpa_account_groups)["UnitsAsPerSubmission"].sum()
+            for account_id, value in lbpa_units_by_account.items():
+                if account_id:
+                    account_units_sums[account_id] = account_units_sums.get(account_id, 0) + value
+        
+        if "IsInitialSubmission" in lbpa_df.columns and "AccountID" in lbpa_df.columns:
+            lbpa_account_groups = lbpa_df["AccountID"].astype(str).str.replace(r"[^0-9]", "", regex=True)
+            lbpa_df["IsInitialSubmission"] = pd.to_numeric(lbpa_df["IsInitialSubmission"], errors="coerce").fillna(0)
+            lbpa_apps_by_account = lbpa_df.groupby(lbpa_account_groups)["IsInitialSubmission"].sum()
+            for account_id, value in lbpa_apps_by_account.items():
+                if account_id:
+                    account_app_sums[account_id] = account_app_sums.get(account_id, 0) + value
+        
+        # Map sums to rows with missing customer_id using account_id
+        if account_units_sums:
+            missing_account_ids = combined_internal.loc[missing_customer_mask, "account_id"].astype(str).str.replace(r"[^0-9]", "", regex=True)
+            mapped_units = missing_account_ids.map(account_units_sums).fillna(0)
+            combined_internal.loc[missing_customer_mask, "UnitsAsPerSubmission"] = mapped_units.values
+        
+        if account_app_sums:
+            missing_account_ids = combined_internal.loc[missing_customer_mask, "account_id"].astype(str).str.replace(r"[^0-9]", "", regex=True)
+            mapped_apps = missing_account_ids.map(account_app_sums).fillna(0)
+            combined_internal.loc[missing_customer_mask, "IsInitialSubmission"] = mapped_apps.values
+    
     # Update value column based on event_type_name:
     # - If event_type_name contains "unit" → value = UnitsAsPerSubmission
     # - If event_type_name contains "app" → value = IsInitialSubmission
@@ -1334,9 +1393,16 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_clients=None, resol
     ]
     
     # Separate unmapped rows (customer_id is missing AND CustomerName is still numeric/account ID)
-    customer_id_missing = combined_internal["customer_id"].isna() | (combined_internal["customer_id"].astype(str).str.strip() == "")
+    # Use the same logic as valid_customer_mask to identify invalid customer_ids
+    customer_id_missing = (
+        combined_internal["customer_id"].isna() |
+        (combined_internal["customer_id"].astype(str).str.strip() == "") |
+        (combined_internal["customer_id"].astype(str).str.strip().str.lower() == "nan") |
+        (combined_internal["customer_id"].astype(str).str.strip() == "None")
+    )
     customer_name_is_numeric = combined_internal["CustomerName"].astype(str).str.match(r'^\d+$', na=False)
     unmapped_mask = customer_id_missing & customer_name_is_numeric
+    
     
     # Also check for rows with invalid customer_id (not just missing, but also "nan", "None", empty)
     invalid_customer_mask = (
@@ -1349,10 +1415,19 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_clients=None, resol
     # Create separate DataFrames for mapped and unmapped rows
     # Only include rows with valid customer_id in the main output
     unmapped_df = combined_internal[unmapped_mask].copy()
+    
+    # Separate rows with missing customer_id (regardless of CustomerName status)
+    missing_customer_id_df = combined_internal[customer_id_missing].copy()
+    
     mapped_df = combined_internal[valid_customer_mask].copy()  # Use valid_customer_mask instead of ~unmapped_mask
     
     combined = mapped_df[upload_cols]
     unmapped_output = unmapped_df[upload_cols] if len(unmapped_df) > 0 else pd.DataFrame(columns=upload_cols)
+    
+    
+    # Create CSV for rows with missing customer_id
+    missing_customer_id_output = missing_customer_id_df[upload_cols] if len(missing_customer_id_df) > 0 else pd.DataFrame(columns=upload_cols)
+    missing_customer_id_csv_bytes = missing_customer_id_output.to_csv(index=False).encode("utf-8") if len(missing_customer_id_output) > 0 else b""
 
     # Prepare in-memory CSV bytes
     combined_csv_bytes = combined.to_csv(index=False).encode("utf-8")
@@ -1383,6 +1458,23 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_clients=None, resol
         st.session_state["unmapped_count"] = 0
         if "unmapped_preview_df" in st.session_state:
             del st.session_state["unmapped_preview_df"]
+    
+    # Store missing customer_id CSV
+    if len(missing_customer_id_output) > 0:
+        st.session_state["generated_files"]["usage_missing_customer_id"] = {
+            "name": "LoanLogics_upload_Missing_Customer_ID.csv",
+            "bytes": missing_customer_id_csv_bytes,
+        }
+        st.session_state["missing_customer_id_count"] = len(missing_customer_id_output)
+        # Store missing customer_id DataFrame for preview
+        st.session_state["missing_customer_id_preview_df"] = missing_customer_id_output.copy()
+    else:
+        # Clear missing customer_id files if no missing rows
+        if "usage_missing_customer_id" in st.session_state.get("generated_files", {}):
+            del st.session_state["generated_files"]["usage_missing_customer_id"]
+        st.session_state["missing_customer_id_count"] = 0
+        if "missing_customer_id_preview_df" in st.session_state:
+            del st.session_state["missing_customer_id_preview_df"]
 
     # Store original dataframes for later split CSV generation with all columns
     st.session_state["original_income_df"] = income_df.copy()
@@ -1644,10 +1736,29 @@ with usage_tab:
             key="dl_usage_latest",
         )
         
-        # Show unmapped CSV download if any unmapped rows exist
+        # Show missing customer_id CSV download if any missing customer_id rows exist
+        if st.session_state.get("generated_files", {}).get("usage_missing_customer_id"):
+            missing_customer_id_count = st.session_state.get("missing_customer_id_count", 0)
+            st.warning(f"⚠️ {missing_customer_id_count} rows have missing customer_id and have been separated into a separate CSV file.")
+            
+            # Show missing customer_id preview under the warning message
+            if st.session_state.get("missing_customer_id_preview_df") is not None:
+                with st.expander("Missing Customer ID Rows Preview", expanded=False):
+                    missing_customer_id_df = st.session_state["missing_customer_id_preview_df"]
+                    st.caption(f"Rows: {len(missing_customer_id_df):,} | Columns: {len(missing_customer_id_df.columns)}")
+                    st.dataframe(missing_customer_id_df, use_container_width=True)
+            
+            st.download_button(
+                "Download Missing Customer ID CSV",
+                data=st.session_state["generated_files"]["usage_missing_customer_id"]["bytes"],
+                file_name=st.session_state["generated_files"]["usage_missing_customer_id"]["name"],
+                key="dl_missing_customer_id_latest",
+            )
+        
+        # Show unmapped CSV download if any unmapped rows exist (subset of missing customer_id)
         if st.session_state.get("generated_files", {}).get("usage_unmapped"):
             unmapped_count = st.session_state.get("unmapped_count", 0)
-            st.warning(f"⚠️ {unmapped_count} rows could not be mapped to customers and have been separated into a separate CSV file.")
+            st.warning(f"⚠️ {unmapped_count} rows could not be mapped to customers (unmapped account IDs) and have been separated into a separate CSV file.")
             
             # Show unmapped preview under the warning message
             if st.session_state.get("unmapped_preview_df") is not None:

@@ -534,6 +534,7 @@ if "generated_files" not in st.session_state:
 # We persist the NetSuite→Tabs ID cache to disk and hydrate it at startup.
 _CACHE_DIR = os.path.join(OUTPUT_DIR, "_session")
 _NS_CACHE_FILE = os.path.join(_CACHE_DIR, "ns_to_tabs_cache.json")
+_CLIENT_MAPPINGS_FILE = os.path.join(_CACHE_DIR, "client_mappings.json")
 
 def _ensure_cache_dir_exists() -> None:
     try:
@@ -559,6 +560,37 @@ def _save_ns_cache_to_disk(cache: dict) -> None:
         import json
         with open(_NS_CACHE_FILE, "w", encoding="utf-8") as f:
             json.dump(cache, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+def _load_client_mappings_from_disk() -> dict:
+    """Load client mappings (parent_to_id, acct_to_tabs_id, etc.) from disk"""
+    try:
+        if os.path.exists(_CLIENT_MAPPINGS_FILE):
+            import json
+            with open(_CLIENT_MAPPINGS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    return {
+                        "parent_to_id": {str(k): str(v) for k, v in data.get("parent_to_id", {}).items()},
+                        "acct_to_tabs_id": {str(k): str(v) for k, v in data.get("acct_to_tabs_id", {}).items()},
+                        "acct_to_ns_id": {str(k): str(v) for k, v in data.get("acct_to_ns_id", {}).items()},
+                        "acct_to_income_evt": {str(k): str(v) for k, v in data.get("acct_to_income_evt", {}).items()},
+                        "acct_to_lbpa_evt": {str(k): str(v) for k, v in data.get("acct_to_lbpa_evt", {}).items()},
+                        "acct_to_diff_name": {str(k): str(v) for k, v in data.get("acct_to_diff_name", {}).items()},
+                        "acct_to_base_name": {str(k): str(v) for k, v in data.get("acct_to_base_name", {}).items()},
+                    }
+    except Exception:
+        pass
+    return {}
+
+def _save_client_mappings_to_disk(mappings: dict) -> None:
+    """Save client mappings to disk"""
+    try:
+        _ensure_cache_dir_exists()
+        import json
+        with open(_CLIENT_MAPPINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(mappings, f, ensure_ascii=False)
     except Exception:
         pass
 
@@ -613,15 +645,19 @@ def persist_upload(uploaded_file, key: str) -> None:
         except Exception:
             pass
 
-# Auto-load default clients mapping from session directory (if exists) so UI can hide uploader
+# Load client mappings from disk at startup
 try:
-    default_clients_path = os.path.join(_DEF_SESSION_DIR, "clients.csv")
-    if os.path.exists(default_clients_path):
-        already = st.session_state.get("uploaded_files", {}).get("clients")
-        if not already:
-            persist_upload(default_clients_path, "clients")
+    if "client_mappings_loaded" not in st.session_state:
+        disk_mappings = _load_client_mappings_from_disk()
+        if disk_mappings:
+            st.session_state["client_mappings"] = disk_mappings
+            st.session_state["client_mappings_loaded"] = True
+        else:
+            st.session_state["client_mappings"] = {}
+            st.session_state["client_mappings_loaded"] = True
 except Exception:
-    pass
+    st.session_state["client_mappings"] = {}
+    st.session_state["client_mappings_loaded"] = True
 
 # ---------- header helpers ----------
 _def_norm_regex = re.compile(r"[^a-z0-9]")
@@ -754,7 +790,8 @@ def detect_header_row(uploaded_clients):
     df_clients = df_clients.apply(lambda x: x.astype(str).str.strip())
     return df_clients
 
-def transform_usage(uploaded_income, uploaded_lbpa, uploaded_clients, resolve_now: bool = False, usage_date=None):
+def extract_mappings_from_clients(uploaded_clients):
+    """Extract mappings from clients CSV file"""
     df_clients = detect_header_row(uploaded_clients)
 
     name_col = find_column(df_clients, ["name", "customer", "customername"]) 
@@ -764,19 +801,9 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_clients, resolve_no
     acctnum_col = find_column(df_clients, ["acct#", "acct #", "acctno", "acct no", "acct", "accountid", "account id", "accountnumber", "account number", "acctnum"]) 
     netsuite_id_col = find_column(df_clients, ["netsuite", "netsuite id", "netsuiteid", "ns id", "external id", "netsuite internal id"]) 
     diff_name_col = find_column(df_clients, ["account name", "name with prefix", "subsidiary", "subsidiary name"]) 
-    # Generic event typing columns from the mapping sheet
     rev_type_col = find_column(df_clients, ["rev. type", "rev type", "revenue type", "rev"]) 
     billing_type_col = find_column(df_clients, ["billing type", "billing", "bill type"]) 
-    # We accept either:
-    # 1) Tabs export: Name/Name With Prefix + ID (direct customer_id mapping), or
-    # 2) Mapping by AccountID (Acct#). NetSuite ID is optional here; if absent, we'll still transform
-    #    and leave customer_id blank to be resolved later in the Attachment tab.
-    if not ((name_col and id_col) or acctnum_col):
-        try:
-            st.warning("Customer mapping CSV missing Acct# and Name+ID; proceeding without customer_id mapping.")
-        except Exception:
-            pass
-
+    
     parent_to_id_raw: dict[str, str] = {}
     acct_to_tabs_id: dict[str, str] = {}
     acct_to_ns_id: dict[str, str] = {}
@@ -784,9 +811,10 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_clients, resolve_no
     acct_to_lbpa_evt: dict[str, str] = {}
     acct_to_diff_name: dict[str, str] = {}
     acct_to_base_name: dict[str, str] = {}
-    # Identify parents with multiple subsidiaries by counting Customer occurrences
+    
     base_names_series = df_clients[name_col] if name_col else pd.Series([], dtype=str)
     base_name_counts = Counter(str(x).strip() for x in base_names_series) if not base_names_series.empty else {}
+    
     for _, r in df_clients.iterrows():
         tabs_id_val = str(r[id_col]).strip() if id_col else ""
         if name_col and tabs_id_val:
@@ -812,12 +840,10 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_clients, resolve_no
         if acctnum_col and diff_name_col:
             acct_key = re.sub(r"[^0-9]", "", str(r[acctnum_col]))
             dval = str(r[diff_name_col]).strip()
-            # Differentiator only when this customer appears multiple times and account name differs from base customer
             base_name = str(r[name_col]).strip() if name_col else ""
             if acct_key and dval and base_name:
                 if base_name_counts.get(base_name, 0) > 1 and normalize_name(dval) != normalize_name(base_name):
                     acct_to_diff_name[acct_key] = f"{base_name} - {dval}"
-        # Derive per-product event type from Rev Type + Billing Type when present
         if acctnum_col and (rev_type_col or billing_type_col):
             acct_key = re.sub(r"[^0-9]", "", str(r[acctnum_col]))
             rev_val = str(r[rev_type_col]).strip().lower() if rev_type_col else ""
@@ -828,8 +854,66 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_clients, resolve_no
                     acct_to_income_evt[acct_key] = evt
                 if "lbpa" in rev_val or "l b p a" in rev_val or "loanbeam per application" in rev_val:
                     acct_to_lbpa_evt[acct_key] = evt
-
+    
     parent_to_id = {normalize_name(k): v for k, v in parent_to_id_raw.items()}
+    
+    return {
+        "parent_to_id": parent_to_id,
+        "acct_to_tabs_id": acct_to_tabs_id,
+        "acct_to_ns_id": acct_to_ns_id,
+        "acct_to_income_evt": acct_to_income_evt,
+        "acct_to_lbpa_evt": acct_to_lbpa_evt,
+        "acct_to_diff_name": acct_to_diff_name,
+        "acct_to_base_name": acct_to_base_name,
+    }
+
+def transform_usage(uploaded_income, uploaded_lbpa, uploaded_clients=None, resolve_now: bool = False, usage_date=None, mappings=None):
+    # Load mappings: use provided mappings, or extract from clients file, or load from disk
+    if mappings:
+        # Use provided mappings
+        parent_to_id = mappings.get("parent_to_id", {})
+        acct_to_tabs_id = mappings.get("acct_to_tabs_id", {})
+        acct_to_ns_id = mappings.get("acct_to_ns_id", {})
+        acct_to_income_evt = mappings.get("acct_to_income_evt", {})
+        acct_to_lbpa_evt = mappings.get("acct_to_lbpa_evt", {})
+        acct_to_diff_name = mappings.get("acct_to_diff_name", {})
+        acct_to_base_name = mappings.get("acct_to_base_name", {})
+    elif uploaded_clients:
+        # Extract mappings from clients file
+        mappings = extract_mappings_from_clients(uploaded_clients)
+        # Save to disk for future use
+        _save_client_mappings_to_disk(mappings)
+        parent_to_id = mappings.get("parent_to_id", {})
+        acct_to_tabs_id = mappings.get("acct_to_tabs_id", {})
+        acct_to_ns_id = mappings.get("acct_to_ns_id", {})
+        acct_to_income_evt = mappings.get("acct_to_income_evt", {})
+        acct_to_lbpa_evt = mappings.get("acct_to_lbpa_evt", {})
+        acct_to_diff_name = mappings.get("acct_to_diff_name", {})
+        acct_to_base_name = mappings.get("acct_to_base_name", {})
+    else:
+        # Try to load from disk
+        mappings = _load_client_mappings_from_disk()
+        if mappings:
+            parent_to_id = mappings.get("parent_to_id", {})
+            acct_to_tabs_id = mappings.get("acct_to_tabs_id", {})
+            acct_to_ns_id = mappings.get("acct_to_ns_id", {})
+            acct_to_income_evt = mappings.get("acct_to_income_evt", {})
+            acct_to_lbpa_evt = mappings.get("acct_to_lbpa_evt", {})
+            acct_to_diff_name = mappings.get("acct_to_diff_name", {})
+            acct_to_base_name = mappings.get("acct_to_base_name", {})
+        else:
+            # No mappings available - use empty dicts
+            parent_to_id = {}
+            acct_to_tabs_id = {}
+            acct_to_ns_id = {}
+            acct_to_income_evt = {}
+            acct_to_lbpa_evt = {}
+            acct_to_diff_name = {}
+            acct_to_base_name = {}
+            try:
+                st.warning("No client mappings found. Proceeding without customer_id mapping.")
+            except Exception:
+                pass
 
     def process_usage(df: pd.DataFrame, event_type_name: str, qty_col_candidates: list[str]):
         df.columns = df.columns.str.strip()
@@ -1484,6 +1568,22 @@ with usage_tab:
             except Exception as e:
                 st.error(f"Could not preview LBPA file: {e}")
 
+    # Client mappings are automatically loaded from disk at startup
+    # Show mappings status
+    current_mappings = st.session_state.get("client_mappings", {})
+    if not current_mappings:
+        # Try to load from disk if not in session state
+        disk_mappings = _load_client_mappings_from_disk()
+        if disk_mappings:
+            st.session_state["client_mappings"] = disk_mappings
+            current_mappings = disk_mappings
+    
+    if current_mappings and current_mappings.get("acct_to_ns_id"):
+        mapping_count = len(current_mappings.get("acct_to_ns_id", {}))
+        st.info(f"✅ Client mappings loaded ({mapping_count} NetSuite ID mappings available)")
+    else:
+        st.warning("⚠️ No client mappings found. Please ensure client_mappings.json exists in usage_uploads/_session/")
+
     resolve_now = st.checkbox("Retrieve Tabs Customer IDs (requires API key)")
     if resolve_now:
         st.text_input("Tabs API Key", type="password", key="ui_api_key_usage", placeholder="Enter Tabs API key")
@@ -1503,20 +1603,21 @@ with usage_tab:
             missing.append("Income")
         if not up.get("lbpa", {}).get("bytes"):
             missing.append("LBPA")
-        if not up.get("clients", {}).get("bytes"):
-            missing.append("Clients")
 
         if not missing:
             if not usage_date:
                 st.error("Please select a usage date")
             else:
                 with st.spinner("Running transformation..."):
+                    # Use stored mappings if available
+                    stored_mappings = st.session_state.get("client_mappings")
                     income_df, lbpa_df, combined_csv, combined_internal_csv = transform_usage(
                         BytesIO(up["income"]["bytes"]),
                         BytesIO(up["lbpa"]["bytes"]),
-                        BytesIO(up["clients"]["bytes"]),
+                        uploaded_clients=None,
                         resolve_now=resolve_now,
                         usage_date=usage_date,
+                        mappings=stored_mappings if stored_mappings else None,
                     )
                 st.success("Transformation complete!")
                 st.session_state["show_usage_download"] = True
@@ -1592,8 +1693,7 @@ with chunk_tab:
         # Check if original data is available
         has_original_data = (
             st.session_state.get("original_income_df") is not None and
-            st.session_state.get("original_lbpa_df") is not None and
-            st.session_state.get("uploaded_files", {}).get("clients", {}).get("bytes") is not None
+            st.session_state.get("original_lbpa_df") is not None
         )
         
         if not has_original_data:

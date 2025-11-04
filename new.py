@@ -2162,7 +2162,7 @@ with chunk_tab:
         
         # Option to upload invoice mapping CSV
         st.markdown("---")
-        st.subheader("Invoice Mapping")
+        st.subheader("Bulk Upload")
         
         upload_option = st.radio(
             "Choose mapping source:",

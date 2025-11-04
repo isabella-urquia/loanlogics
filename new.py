@@ -1484,7 +1484,7 @@ with usage_tab:
             except Exception as e:
                 st.error(f"Could not preview LBPA file: {e}")
 
-    resolve_now = st.checkbox("Map NetSuite IDs to Tabs Customer IDs (requires API key)")
+    resolve_now = st.checkbox("RetrieveTabs Customer IDs (requires API key)")
     if resolve_now:
         st.text_input("Tabs API Key", type="password", key="ui_api_key_usage", placeholder="Enter Tabs API key")
 

@@ -2158,116 +2158,169 @@ with chunk_tab:
                 )
     
     elif current_step == 2:  # Step 3: Bulk Upload
-        st.subheader("Bulk Upload CSV Attachments")
         
-        if not st.session_state.get("invoice_mapping_ready"):
-            st.warning("⚠️ Please complete Step 2 first (Invoice Mapping)")
+        
+        # Option to upload invoice mapping CSV
+        st.markdown("---")
+        st.subheader("Invoice Mapping")
+        
+        upload_option = st.radio(
+            "Choose mapping source:",
+            ["Use generated mapping from Step 2", "Upload CSV mapping file"],
+            key="bulk_upload_mapping_source"
+        )
+        
+        mapping_df = None
+        mapping_ready = False
+        
+        if upload_option == "Upload CSV mapping file":
+            uploaded_mapping = st.file_uploader(
+                "Upload Invoice Mapping CSV",
+                type="csv",
+                help="CSV should have columns: split_csv_filename, customer_id, invoice_id (and optionally issue_date)",
+                key="bulk_upload_mapping_csv"
+            )
+            
+            if uploaded_mapping is not None:
+                try:
+                    mapping_df = pd.read_csv(uploaded_mapping)
+                    # Validate required columns
+                    required_cols = ["split_csv_filename", "customer_id", "invoice_id"]
+                    missing_cols = [col for col in required_cols if col not in mapping_df.columns]
+                    
+                    if missing_cols:
+                        st.error(f"❌ Missing required columns: {', '.join(missing_cols)}")
+                        st.info("Required columns: split_csv_filename, customer_id, invoice_id")
+                    else:
+                        mapping_ready = True
+                        st.success(f"✅ Loaded {len(mapping_df)} mappings from CSV")
+                        st.dataframe(mapping_df, use_container_width=True)
+                except Exception as e:
+                    st.error(f"Error reading CSV: {str(e)}")
         else:
-            mapping_df = st.session_state.get("invoice_mapping")
+            # Use generated mapping from Step 2
+            if not st.session_state.get("invoice_mapping_ready"):
+                st.warning("⚠️ Please complete Step 2 first (Invoice Mapping) or upload a CSV mapping file")
+            else:
+                mapping_df = st.session_state.get("invoice_mapping")
+                mapping_ready = True
+        
+        if mapping_ready and mapping_df is not None:
             split_csvs = st.session_state.get("invoice_split_csvs", [])
             
-            st.info(f"📋 Ready to upload {len(mapping_df)} split CSVs to invoices")
-            
-            # Create lookup dict for split CSVs
-            split_csvs_dict = {split_csv["name"]: split_csv for split_csv in split_csvs}
-            
-            # Show preview
-            st.subheader("Upload Preview")
-            preview_df = mapping_df.copy()
-            preview_df["split_csv_size"] = preview_df["split_csv_filename"].map(
-                lambda x: len(pd.read_csv(BytesIO(split_csvs_dict[x]["bytes"]))) if x in split_csvs_dict else 0
-            )
-            st.dataframe(preview_df, use_container_width=True)
-            
-            api_key = st.session_state.get('invoice_api_key', '')
-            
-            if not api_key:
-                st.warning("⚠️ Please enter API key in Step 2")
+            if not split_csvs:
+                st.warning("⚠️ Split CSVs not found. Please complete Step 1 first (Generate Split CSVs)")
             else:
-                # Add test mode option
-                test_mode = st.checkbox("🧪 Test Mode: Upload only one row from the first split CSV", value=False)
+                st.info(f"📋 Ready to upload {len(mapping_df)} split CSVs to invoices")
                 
-                if st.button("Start Bulk Upload", type="primary"):
-                    try:
-                        with st.spinner("Uploading CSV attachments..."):
-                            upload_results = []
-                            progress_bar = st.progress(0)
-                            
-                            # Limit to first row if test mode is enabled
-                            rows_to_process = mapping_df.head(1) if test_mode else mapping_df
-                            
-                            for idx, row in rows_to_process.iterrows():
-                                split_csv_name = row["split_csv_filename"]
-                                customer_id = row["customer_id"]
-                                invoice_id = row["invoice_id"]
+                # Create lookup dict for split CSVs
+                split_csvs_dict = {split_csv["name"]: split_csv for split_csv in split_csvs}
+            
+                # Show preview
+                st.subheader("Upload Preview")
+                preview_df = mapping_df.copy()
+                preview_df["split_csv_size"] = preview_df["split_csv_filename"].map(
+                    lambda x: len(pd.read_csv(BytesIO(split_csvs_dict[x]["bytes"]))) if x in split_csvs_dict else 0
+                )
+                preview_df["split_csv_exists"] = preview_df["split_csv_filename"].map(
+                    lambda x: "Yes" if x in split_csvs_dict else "No"
+                )
+                st.dataframe(preview_df, use_container_width=True)
+                
+                # Check for missing split CSVs
+                missing_csvs = preview_df[preview_df["split_csv_exists"] == "No"]["split_csv_filename"].tolist()
+                if missing_csvs:
+                    st.warning(f"⚠️ {len(missing_csvs)} split CSV(s) not found: {', '.join(missing_csvs[:5])}{'...' if len(missing_csvs) > 5 else ''}")
+                
+                api_key = st.session_state.get('invoice_api_key', '')
+                
+                if not api_key:
+                    st.warning("⚠️ Please enter API key in Step 2")
+                else:
+                    # Add test mode option
+                    test_mode = st.checkbox("🧪 Test Mode: Upload only one row from the first split CSV", value=False)
+                    
+                    if st.button("Start Bulk Upload", type="primary"):
+                        try:
+                            with st.spinner("Uploading CSV attachments..."):
+                                upload_results = []
+                                progress_bar = st.progress(0)
                                 
-                                if split_csv_name not in split_csvs_dict:
-                                    upload_results.append({
-                                        "split_csv": split_csv_name,
-                                        "status": "Failed",
-                                        "reason": "Split CSV not found"
-                                    })
-                                    continue
+                                # Limit to first row if test mode is enabled
+                                rows_to_process = mapping_df.head(1) if test_mode else mapping_df
                                 
-                                split_csv_bytes = split_csvs_dict[split_csv_name]["bytes"]
-                                
-                                # In test mode, create a CSV with only the first row
-                                if test_mode:
-                                    try:
-                                        test_df = pd.read_csv(BytesIO(split_csv_bytes))
-                                        if len(test_df) > 0:
-                                            # Keep only the first row
-                                            test_df = test_df.head(1)
-                                            # Create new filename with "_test" suffix
-                                            test_filename = split_csv_name.replace(".csv", "_test.csv")
-                                            split_csv_bytes = test_df.to_csv(index=False).encode("utf-8")
-                                            split_csv_name = test_filename
-                                        else:
-                                            upload_results.append({
-                                                "split_csv": split_csv_name,
-                                                "status": "Failed",
-                                                "reason": "CSV is empty"
-                                            })
-                                            continue
-                                    except Exception as e:
+                                for idx, row in rows_to_process.iterrows():
+                                    split_csv_name = row["split_csv_filename"]
+                                    customer_id = row["customer_id"]
+                                    invoice_id = row["invoice_id"]
+                                    
+                                    if split_csv_name not in split_csvs_dict:
                                         upload_results.append({
                                             "split_csv": split_csv_name,
                                             "status": "Failed",
-                                            "reason": f"Error reading CSV: {str(e)}"
+                                            "reason": "Split CSV not found"
                                         })
                                         continue
+                                    
+                                    split_csv_bytes = split_csvs_dict[split_csv_name]["bytes"]
+                                    
+                                    # In test mode, create a CSV with only the first row
+                                    if test_mode:
+                                        try:
+                                            test_df = pd.read_csv(BytesIO(split_csv_bytes))
+                                            if len(test_df) > 0:
+                                                # Keep only the first row
+                                                test_df = test_df.head(1)
+                                                # Create new filename with "_test" suffix
+                                                test_filename = split_csv_name.replace(".csv", "_test.csv")
+                                                split_csv_bytes = test_df.to_csv(index=False).encode("utf-8")
+                                                split_csv_name = test_filename
+                                            else:
+                                                upload_results.append({
+                                                    "split_csv": split_csv_name,
+                                                    "status": "Failed",
+                                                    "reason": "CSV is empty"
+                                                })
+                                                continue
+                                        except Exception as e:
+                                            upload_results.append({
+                                                "split_csv": split_csv_name,
+                                                "status": "Failed",
+                                                "reason": f"Error reading CSV: {str(e)}"
+                                            })
+                                            continue
+                                    
+                                    # Upload CSV as attachment to invoice
+                                    success = upload_csv_attachment(
+                                        customer_id,
+                                        invoice_id,
+                                        split_csv_bytes,
+                                        split_csv_name,
+                                        api_key
+                                    )
+                                    
+                                    upload_results.append({
+                                        "split_csv": split_csv_name,
+                                        "customer_id": customer_id,
+                                        "invoice_id": invoice_id,
+                                        "status": "Success" if success else "Failed",
+                                        "reason": "" if success else "Upload failed"
+                                    })
+                                    
+                                    progress_bar.progress((idx + 1) / len(rows_to_process))
                                 
-                                # Upload CSV as attachment to invoice
-                                success = upload_csv_attachment(
-                                    customer_id,
-                                    invoice_id,
-                                    split_csv_bytes,
-                                    split_csv_name,
-                                    api_key
-                                )
+                                results_df = pd.DataFrame(upload_results)
+                                st.session_state["upload_results"] = results_df
                                 
-                                upload_results.append({
-                                    "split_csv": split_csv_name,
-                                    "customer_id": customer_id,
-                                    "invoice_id": invoice_id,
-                                    "status": "Success" if success else "Failed",
-                                    "reason": "" if success else "Upload failed"
-                                })
+                                success_count = (results_df["status"] == "Success").sum()
+                                progress_bar.empty()
                                 
-                                progress_bar.progress((idx + 1) / len(rows_to_process))
-                            
-                            results_df = pd.DataFrame(upload_results)
-                            st.session_state["upload_results"] = results_df
-                            
-                            success_count = (results_df["status"] == "Success").sum()
-                            progress_bar.empty()
-                            
-                            if test_mode:
-                                st.success(f"✅ Test upload complete! {success_count}/{len(results_df)} successful")
-                            else:
-                                st.success(f"✅ Upload complete! {success_count}/{len(results_df)} successful")
-                            
-                    except Exception as e:
-                        st.error(f"Error during bulk upload: {str(e)}")
-                        import traceback
-                        st.code(traceback.format_exc())
+                                if test_mode:
+                                    st.success(f"✅ Test upload complete! {success_count}/{len(results_df)} successful")
+                                else:
+                                    st.success(f"✅ Upload complete! {success_count}/{len(results_df)} successful")
+                                
+                        except Exception as e:
+                            st.error(f"Error during bulk upload: {str(e)}")
+                            import traceback
+                            st.code(traceback.format_exc())

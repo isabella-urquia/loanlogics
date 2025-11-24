@@ -24,6 +24,7 @@ if not API_KEY:
         API_KEY = ""
 API_URL_BASE = "https://integrators.prod.api.tabsplatform.com/v3/customers"
 API_INVOICES_URL = "https://integrators.prod.api.tabsplatform.com/v3/invoices"
+NETSUITE_API_BASE = "https://integrators.prod.api.tabsplatform.com"
 # =================================
 
 # Initialize session state variables
@@ -680,11 +681,558 @@ def find_column(df: pd.DataFrame, candidates: list[str]) -> str | None:
     return None
 # ------------------------------------
 
+# Custom field ID for Customer Number (stores NetSuite Account ID)
+CUSTOMER_NUMBER_FIELD_ID = "edaefe3e-46b9-4212-957b-8140df8e2890"
+
+def extract_account_id_from_entity_id(entity_id: str) -> str | None:
+    """Extract the numeric Account ID from NetSuite entityId.
+    Example: '8516 Regions Bank - NMS' -> '8516'
+    Example: '8544 1st Security Bank of Washington - NMS' -> '8544'
+    """
+    if not entity_id:
+        return None
+    
+    entity_id = str(entity_id).strip()
+    # Extract the first numeric part (before the first space)
+    match = re.match(r'^(\d+)', entity_id)
+    if match:
+        return match.group(1)
+    return None
+
+
+def get_customer_from_netsuite(tabs_customer_id: str, manufacturer_id: str = None, verbose: bool = False) -> dict | None:
+    """Get customer from NetSuite API using TABS customer ID.
+    The API endpoint expects TABS customer ID and manufacturer ID.
+    Returns customer data with entityId if found, None otherwise.
+    """
+    if not tabs_customer_id or not get_api_key():
+        return None
+    
+    api_key = get_api_key()
+    headers = {
+        "Authorization": api_key,  # Don't use f-string, use raw API key
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+    }
+    
+    # Try to get manufacturer_id from environment or use default
+    if not manufacturer_id:
+        manufacturer_id = os.getenv("TABS_MANUFACTURER_ID", "388ca94d-6fa9-4121-9d2c-a37fb790382c")
+    
+    url = f"{NETSUITE_API_BASE}/v2/integrations/netsuite/merchant/{manufacturer_id}/customers/{tabs_customer_id}"
+    
+    if verbose:
+        st.write(f"   🔍 Calling NetSuite API: {url}")
+        st.write(f"   🔑 Using API key: {api_key[:20]}..." if api_key and len(api_key) > 20 else "   🔑 API key: (empty)")
+        st.write(f"   📋 Headers: {list(headers.keys())}")
+    
+    try:
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        
+        # Disable automatic redirects to avoid redirect loops
+        res = requests.get(url, headers=headers, timeout=10, verify=False, allow_redirects=False)
+        
+        if verbose:
+            st.write(f"   📊 Response status: {res.status_code}")
+            st.write(f"   📄 Response headers: {dict(res.headers)}")
+        
+        # Handle redirects manually (only follow one redirect to avoid loops)
+        if res.status_code in (301, 302, 303, 307, 308):
+            redirect_url = res.headers.get('Location')
+            if verbose:
+                st.write(f"   🔄 Redirect detected to: {redirect_url}")
+            if redirect_url:
+                # If redirect URL is relative, make it absolute
+                if redirect_url.startswith('/'):
+                    from urllib.parse import urljoin
+                    redirect_url = urljoin(url, redirect_url)
+                # Follow redirect once
+                res = requests.get(redirect_url, headers=headers, timeout=10, verify=False, allow_redirects=False)
+                if verbose:
+                    st.write(f"   📊 Redirect response status: {res.status_code}")
+        
+        if res.status_code == 200:
+            try:
+                data = res.json()
+                if verbose:
+                    st.write(f"   ✅ NetSuite API response received")
+                    # Only show entityId in verbose to avoid huge output
+                    entity_id = data.get("entityId") if isinstance(data, dict) else None
+                    if entity_id:
+                        st.write(f"   📍 Found entityId: {entity_id}")
+                
+                # The API returns entityId directly in the response (e.g., "8840 1st Source Bank - NMS")
+                # Return the full data structure - caller will extract entityId
+                return data
+            except Exception as e:
+                if verbose:
+                    st.write(f"   ⚠️ Error parsing JSON response: {str(e)}")
+                    st.write(f"   Raw response: {res.text[:500]}")
+                return None
+        elif res.status_code == 404:
+            # 404 means customer is not linked to NetSuite for this manufacturer - this is expected for some customers
+            if verbose:
+                st.write(f"   ℹ️ Customer not linked to NetSuite (404) - skipping")
+            return None
+        elif res.status_code == 401 or res.status_code == 403:
+            if verbose:
+                st.write(f"   ⚠️ Authentication failed ({res.status_code}) for TABS customer {tabs_customer_id}")
+                st.write(f"   Response: {res.text[:500]}")
+            return None
+        elif verbose:
+            st.write(f"   ⚠️ NetSuite API returned {res.status_code} for TABS customer {tabs_customer_id}")
+            st.write(f"   Response: {res.text[:500]}")
+        return None
+    except Exception as e:
+        if verbose:
+            st.write(f"   ⚠️ Error calling NetSuite API for TABS customer {tabs_customer_id}: {str(e)}")
+        return None
+
+
+def update_customer_custom_field(customer_id: str, field_id: str, value: str) -> bool:
+    """Update a custom field on a TABS customer using PUT /v3/customers/{id}/custom-field
+    Pass an empty string "" as value to clear/remove the custom field value.
+    """
+    if not customer_id or not field_id:
+        return False
+    
+    # Allow empty string to clear the field value
+    # Convert value to string, but allow empty strings
+    value_str = str(value).strip() if value is not None else ""
+    
+    api_key = get_api_key()
+    if not api_key:
+        return False
+    
+    headers = {
+        "Authorization": f"{api_key}",
+        "Content-Type": "application/json"
+    }
+    
+    # Use the custom-field endpoint (singular) as shown in API docs
+    url = f"{API_URL_BASE}/{customer_id}/custom-field"
+    
+    try:
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        
+        # API expects an array of objects with manufacturerCustomFieldId and customFieldValue
+        # Empty string should clear the field value
+        payload = [
+            {
+                "manufacturerCustomFieldId": field_id,
+                "customFieldValue": value_str
+            }
+        ]
+        
+        put_res = requests.put(url, headers=headers, json=payload, timeout=10, verify=False)
+        
+        if put_res.status_code in (200, 201, 204):
+            return True
+        else:
+            st.write(f"Failed to update custom field for customer {customer_id}: {put_res.status_code} - {put_res.text}")
+            return False
+    except Exception as e:
+        st.write(f"Error updating custom field for customer {customer_id}: {str(e)}")
+        return False
+
+
+def build_name_to_customer_mapping() -> dict[str, str]:
+    """Build a mapping from customer name (normalized) to customer_id by fetching all customers"""
+    mapping = {}
+    api_key = get_api_key()
+    if not api_key:
+        st.write("⚠️ No API key available for building name mapping")
+        return mapping
+    
+    headers = {
+        "Authorization": f"{api_key}",
+        "Content-Type": "application/json"
+    }
+    
+    try:
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        
+        # Fetch customers with pagination
+        url = f"{API_URL_BASE}"
+        page = 1  # API pages start at 1, not 0
+        limit = 100
+        
+        while True:
+            params = {"page": page, "limit": limit}
+            res = requests.get(url, headers=headers, params=params, timeout=30, verify=False)
+            
+            if res.status_code != 200:
+                st.write(f"⚠️ API request failed with status {res.status_code}: {res.text[:200]}")
+                break
+            
+            data = res.json()
+            payload = data.get("payload", {})
+            customers = payload.get("data", [])
+            
+            if not customers:
+                if page == 1:
+                    st.write("⚠️ No customers returned from API")
+                break
+            
+            # Extract customer name and create normalized mapping
+            for customer in customers:
+                customer_id = str(customer.get("id", "")).strip()
+                customer_name = str(customer.get("name", "")).strip()
+                if customer_id and customer_name:
+                    # Normalize name (same as normalize_name function)
+                    normalized = normalize_name(customer_name)
+                    mapping[normalized] = customer_id
+                    # Also map the original name (lowercase)
+                    mapping[customer_name.lower()] = customer_id
+            
+            # Check if there are more pages
+            total_items = payload.get("totalItems", 0)
+            current_page = payload.get("currentPage", page)
+            if (current_page + 1) * limit >= total_items:
+                break
+            
+            page += 1
+            if page % 5 == 0:
+                st.write(f"   Processed {page * limit} customers, built {len(mapping)} name mappings...")
+            
+    except Exception as e:
+        st.write(f"Error building name to customer mapping: {str(e)}")
+        import traceback
+        st.write(f"Traceback: {traceback.format_exc()}")
+    
+    return mapping
+
+
+def build_account_id_to_customer_mapping() -> dict[str, str]:
+    """Build a mapping from AccountID (Customer Number custom field) to customer_id by fetching all customers"""
+    mapping = {}
+    api_key = get_api_key()
+    if not api_key:
+        return mapping
+    
+    headers = {
+        "Authorization": f"{api_key}",
+        "Content-Type": "application/json"
+    }
+    
+    try:
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        
+        # Fetch customers with pagination
+        url = f"{API_URL_BASE}"
+        page = 1  # API pages start at 1, not 0
+        limit = 100
+        
+        while True:
+            params = {"page": page, "limit": limit}
+            res = requests.get(url, headers=headers, params=params, timeout=30, verify=False)
+            
+            if res.status_code != 200:
+                break
+            
+            data = res.json()
+            payload = data.get("payload", {})
+            customers = payload.get("data", [])
+            
+            if not customers:
+                break
+            
+            # Extract AccountID from Customer Number custom field for each customer
+            # Note: customFields might not be in the list response, so we fetch each customer individually
+            for customer in customers:
+                customer_id = str(customer.get("id", "")).strip()
+                if not customer_id:
+                    continue
+                
+                # Fetch individual customer to get customFields (they might not be in list response)
+                try:
+                    customer_url = f"{API_URL_BASE}/{customer_id}"
+                    customer_res = requests.get(customer_url, headers=headers, timeout=10, verify=False)
+                    if customer_res.status_code == 200:
+                        customer_data = customer_res.json()
+                        # Extract customer object from response
+                        # Based on debug output: payload IS the customer object (has 'id', 'name', 'customFields', etc.)
+                        customer_obj = None
+                        if "payload" in customer_data:
+                            payload = customer_data["payload"]
+                            if isinstance(payload, dict):
+                                # Payload itself is the customer object if it has customer-like keys
+                                if "id" in payload or "name" in payload:
+                                    customer_obj = payload
+                                # Otherwise check if it has a "data" key
+                                elif "data" in payload:
+                                    data = payload["data"]
+                                    if isinstance(data, list) and len(data) > 0:
+                                        customer_obj = data[0]
+                                    elif isinstance(data, dict):
+                                        customer_obj = data
+                            elif isinstance(payload, list) and len(payload) > 0:
+                                customer_obj = payload[0]
+                        else:
+                            # No payload wrapper, data might be at root level
+                            customer_obj = customer_data.get("data") or customer_data
+                        
+                        if customer_obj:
+                            # customFields is a list, not a dict
+                            custom_fields = customer_obj.get("customFields", [])
+                            
+                            # customFields is a list of field objects
+                            # Each field object should have: manufacturerCustomFieldId and customFieldValue
+                            if isinstance(custom_fields, list):
+                                # Search for the Customer Number field in the list
+                                for field in custom_fields:
+                                    if isinstance(field, dict):
+                                        # Try different possible field ID keys
+                                        field_id = (
+                                            field.get("manufacturerCustomFieldId") or 
+                                            field.get("id") or 
+                                            field.get("fieldId") or
+                                            field.get("customFieldId")
+                                        )
+                                        if field_id == CUSTOMER_NUMBER_FIELD_ID:
+                                            # Try different possible value keys
+                                            field_value = (
+                                                field.get("customFieldValue") or 
+                                                field.get("value") or
+                                                field.get("fieldValue")
+                                            )
+                                            if field_value and str(field_value).strip():
+                                                account_id = re.sub(r"[^0-9]", "", str(field_value).strip())
+                                                if account_id:
+                                                    mapping[account_id] = customer_id
+                                                    break
+                            elif isinstance(custom_fields, dict):
+                                # Fallback: if it's a dict (old format), try direct lookup
+                                customer_number = custom_fields.get(CUSTOMER_NUMBER_FIELD_ID)
+                                if customer_number:
+                                    account_id = re.sub(r"[^0-9]", "", str(customer_number).strip())
+                                    if account_id:
+                                        mapping[account_id] = customer_id
+                except Exception as e:
+                    if len(mapping) == 0 and page == 1:
+                        st.write(f"⚠️ Error fetching customer {customer_id}: {str(e)}")
+                    continue
+            
+            # Check if there are more pages
+            total_items = payload.get("totalItems", 0)
+            current_page = payload.get("currentPage", page)
+            if (current_page + 1) * limit >= total_items:
+                break
+            
+            page += 1
+            # Show progress
+            if page % 5 == 0:
+                st.write(f"   Processed {page * limit} customers, found {len(mapping)} with Customer Number custom field...")
+            
+    except Exception as e:
+        st.write(f"Error building AccountID to customer mapping: {str(e)}")
+        import traceback
+        st.write(f"Traceback: {traceback.format_exc()}")
+    
+    return mapping
+
+
+def get_customer_custom_field_value(customer_id: str, field_id: str) -> str | None:
+    """Get the current value of a custom field for a customer"""
+    if not customer_id or not field_id:
+        return None
+    
+    api_key = get_api_key()
+    if not api_key:
+        return None
+    
+    headers = {
+        "Authorization": f"{api_key}",
+        "Content-Type": "application/json"
+    }
+    
+    url = f"{API_URL_BASE}/{customer_id}"
+    
+    try:
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        
+        res = requests.get(url, headers=headers, timeout=10, verify=False)
+        if res.status_code == 200:
+            data = res.json()
+            payload = data.get("payload", {})
+            customer_obj = payload if isinstance(payload, dict) and "id" in payload else None
+            
+            if customer_obj:
+                custom_fields = customer_obj.get("customFields", [])
+                if isinstance(custom_fields, list):
+                    for field in custom_fields:
+                        if isinstance(field, dict):
+                            field_id_check = (
+                                field.get("manufacturerCustomFieldId") or 
+                                field.get("id") or 
+                                field.get("fieldId")
+                            )
+                            if field_id_check == field_id:
+                                return field.get("customFieldValue") or field.get("value")
+    except Exception:
+        pass
+    
+    return None
+
+
+def sync_customer_number_from_entity_id(customer_obj: dict) -> bool:
+    """Extract Account ID from customer's entityId and update the Customer Number custom field.
+    This is called when a customer is fetched from NetSuite sync.
+    Returns True if the field was updated, False otherwise.
+    """
+    if not customer_obj:
+        return False
+    
+    customer_id = str(customer_obj.get("id") or "").strip()
+    if not customer_id:
+        return False
+    
+    # Check if the custom field already has a value
+    current_value = get_customer_custom_field_value(customer_id, CUSTOMER_NUMBER_FIELD_ID)
+    if current_value and str(current_value).strip():
+        # Custom field already has a value, don't overwrite it
+        return False
+    
+    # Get entityId from customer object
+    entity_id = customer_obj.get("entityId") or customer_obj.get("entity_id")
+    if not entity_id:
+        return False
+    
+    # Extract the numeric Account ID from entityId (e.g., "8516" from "8516 Regions Bank - NMS")
+    account_id = extract_account_id_from_entity_id(entity_id)
+    if not account_id:
+        return False
+    
+    # Update the custom field with the Account ID
+    return update_customer_custom_field(customer_id, CUSTOMER_NUMBER_FIELD_ID, account_id)
+
+
+def backfill_customer_number_from_entity_id(account_ids_to_find: set[str] | None = None) -> dict[str, int]:
+    """Backfill Customer Number custom field for customers that have entityId but missing the custom field.
+    If account_ids_to_find is provided, only processes customers whose entityId contains those AccountIDs.
+    This can be run as a batch process to set custom fields for customers already synced from NetSuite.
+    Returns a dict with counts: {'updated': X, 'skipped': Y, 'errors': Z}
+    """
+    results = {'updated': 0, 'skipped': 0, 'errors': 0}
+    
+    api_key = get_api_key()
+    if not api_key:
+        return results
+    
+    # Track which AccountIDs we've found (either updated or already had custom field)
+    found_account_ids = set()
+    
+    headers = {
+        "Authorization": f"{api_key}",
+        "Content-Type": "application/json"
+    }
+    
+    try:
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        
+        # Fetch all customers with pagination
+        url = f"{API_URL_BASE}"
+        page = 1
+        limit = 100
+        
+        while True:
+            params = {"page": page, "limit": limit}
+            res = requests.get(url, headers=headers, params=params, timeout=30, verify=False)
+            
+            if res.status_code != 200:
+                break
+            
+            data = res.json()
+            payload = data.get("payload", {})
+            customers = payload.get("data", [])
+            
+            if not customers:
+                break
+            
+            # Process each customer
+            for customer in customers:
+                customer_id = str(customer.get("id", "")).strip()
+                if not customer_id:
+                    continue
+                
+                # Check if customer has entityId in list response
+                entity_id = customer.get("entityId") or customer.get("entity_id")
+                
+                # If not in list response, fetch individual customer
+                if not entity_id:
+                    try:
+                        customer_url = f"{API_URL_BASE}/{customer_id}"
+                        customer_res = requests.get(customer_url, headers=headers, timeout=10, verify=False)
+                        if customer_res.status_code == 200:
+                            customer_data = customer_res.json()
+                            payload_obj = customer_data.get("payload", {})
+                            # Payload itself is the customer object
+                            if isinstance(payload_obj, dict) and "id" in payload_obj:
+                                entity_id = payload_obj.get("entityId") or payload_obj.get("entity_id")
+                                
+                                # Update customer object with fetched data for sync function
+                                customer = payload_obj
+                    except Exception as e:
+                        pass
+                
+                if not entity_id:
+                    results['skipped'] += 1
+                    continue
+                
+                # Extract Account ID first to check if we should process this customer
+                account_id = extract_account_id_from_entity_id(entity_id)
+                if not account_id:
+                    results['skipped'] += 1
+                    continue
+                
+                # If we're looking for specific AccountIDs, only process those
+                if account_ids_to_find is not None and account_id not in account_ids_to_find:
+                    results['skipped'] += 1
+                    continue
+                
+                # Check if custom field already has a value
+                current_value = get_customer_custom_field_value(customer_id, CUSTOMER_NUMBER_FIELD_ID)
+                if current_value and str(current_value).strip():
+                    # Already has the field set, mark as found
+                    found_account_ids.add(account_id)
+                    results['skipped'] += 1
+                    continue
+                
+                # Set custom field
+                if sync_customer_number_from_entity_id(customer):
+                    found_account_ids.add(account_id)
+                    results['updated'] += 1
+                else:
+                    results['errors'] += 1
+            
+            # Stop early if we've found all AccountIDs we're looking for
+            if account_ids_to_find and len(found_account_ids) >= len(account_ids_to_find):
+                break
+            
+            # Check if there are more pages
+            total_items = payload.get("totalItems", 0)
+            current_page = payload.get("currentPage", page)
+            if (current_page + 1) * limit >= total_items:
+                break
+            
+            page += 1
+            
+    except Exception as e:
+        st.write(f"Error in backfill process: {str(e)}")
+        results['errors'] += 1
+    
+    return results
+
 
 def resolve_tabs_id_from_ns(ns_external_id: str) -> str | None:
     ns_external_id = str(ns_external_id or "").strip()
     ns_external_id = ns_external_id.replace(".0", "")
-    print(ns_external_id)
     if not ns_external_id:
         return None
     cache = st.session_state.get("ns_to_tabs_cache", {})
@@ -698,8 +1246,6 @@ def resolve_tabs_id_from_ns(ns_external_id: str) -> str | None:
     for params in params_candidates:
         try:
             url = f'{API_URL_BASE}?filter=externalIds.externalId:eq:"{ns_external_id}"'
-            print(f"\nMaking request to: {url}")
-            print(f"Headers: {headers}")
             try:
                 # Disable SSL verification - Note: In production, proper cert verification should be used
                 res = requests.get(url, headers=headers, timeout=10, verify=False)
@@ -707,20 +1253,14 @@ def resolve_tabs_id_from_ns(ns_external_id: str) -> str | None:
                 import urllib3
                 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
                 
-                # print(f"Response Status Code: {res.status_code}")
-                # print(f"Response Headers: {dict(res.headers)}")
-                # try:
-                #     print(f"Response Content: {res.json()}")
-                # except:
-                #     print(f"Raw Response Content: {res.text}")
                 if res.status_code >= 400:
-                    print(f"Error: Request failed with status code {res.status_code}")
+                    pass
             except requests.exceptions.Timeout:
-                print("Error: Request timed out after 10 seconds")
+                pass
             except requests.exceptions.ConnectionError as e:
-                print(f"Error: Connection failed - {str(e)}")
+                pass
             except Exception as e:
-                print(f"Error: Unexpected error - {str(e)}")
+                pass
             if res.status_code >= 400:
                 continue
             data = res.json() if res.headers.get("content-type", "").startswith("application/json") else None
@@ -750,6 +1290,8 @@ def resolve_tabs_id_from_ns(ns_external_id: str) -> str | None:
                         st.session_state["ns_to_tabs_cache"] = cache
                         # Persist to disk
                         _save_ns_cache_to_disk(cache)
+                        # Sync Customer Number custom field from entityId if available
+                        sync_customer_number_from_entity_id(cust)
                         return tabs_id
             # Fallback: first item when search hits
             cust = items[0]
@@ -759,6 +1301,8 @@ def resolve_tabs_id_from_ns(ns_external_id: str) -> str | None:
                 st.session_state["ns_to_tabs_cache"] = cache
                 # Persist to disk
                 _save_ns_cache_to_disk(cache)
+                # Sync Customer Number custom field from entityId if available
+                sync_customer_number_from_entity_id(cust)
                 return tabs_id
         except Exception:
             continue
@@ -877,7 +1421,8 @@ def extract_mappings_from_clients(uploaded_clients):
         "acct_to_base_name": acct_to_base_name,
     }
 
-def transform_usage(uploaded_income, uploaded_lbpa, uploaded_clients=None, resolve_now: bool = False, usage_date=None, mappings=None):
+def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_clients=None, resolve_now: bool = False, usage_date=None, mappings=None, split_customers=None):
+    """Transform usage data from income and LBPA files"""
     # Load mappings: use provided mappings, or extract from clients file, or load from disk
     if mappings:
         # Use provided mappings
@@ -925,10 +1470,35 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_clients=None, resol
             except Exception:
                 pass
 
+    # Helper function to extract AccountID from CustomerNumber (handles floats like 8602.0 -> 8602)
+    # Must be defined before process_usage since process_usage uses it
+    def extract_account_id_from_customer_number(value):
+        if pd.isna(value):
+            return ""
+        # Always convert to float first to handle both int and float inputs, then to int to remove decimal
+        try:
+            # Convert to float first (handles both numeric and string "8602.0")
+            float_val = float(value)
+            # Convert to int to remove decimal part (8602.0 -> 8602)
+            int_val = int(float_val)
+            return str(int_val)
+        except (ValueError, TypeError):
+            # If conversion fails, try string manipulation
+            value_str = str(value).strip()
+            # Remove .0 suffix if present
+            if value_str.endswith('.0'):
+                value_str = value_str[:-2]
+            # Extract only numeric characters
+            account_id = re.sub(r"[^0-9]", "", value_str)
+            return account_id
+
     def process_usage(df: pd.DataFrame, event_type_name: str, qty_col_candidates: list[str]):
         df.columns = df.columns.str.strip()
         parent_col = find_column(df, ["customername", "accountname", "name"])
-        acct_id_col = find_column(df, ["accountid", "acct#", "acct", "account number", "accountnumber"]) 
+        # Prefer CustomerNumber over AccountID since that's what we map with
+        acct_id_col = find_column(df, ["customernumber"])  # Try CustomerNumber first
+        if not acct_id_col:
+            acct_id_col = find_column(df, ["accountid", "acct#", "acct", "account number", "accountnumber"]) 
         datetime_col = find_column(df, ["submissiondate", "date", "createdon", "datetime"])
         qty_col = find_column(df, qty_col_candidates)
         if not parent_col:
@@ -961,17 +1531,18 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_clients=None, resol
         
         df["value"] = pd.to_numeric(df[qty_col], errors="coerce").fillna(0)
         # Always compute account id key if present
+        # Use extract_account_id_from_customer_number if it's CustomerNumber column, otherwise use regex
         if acct_id_col:
-            df["__acct_key__"] = df[acct_id_col].astype(str).str.replace(r"[^0-9]", "", regex=True)
+            if acct_id_col.lower() == "customernumber":
+                # Use the same extraction function we use for mapping
+                df["__acct_key__"] = df[acct_id_col].apply(extract_account_id_from_customer_number)
+            else:
+                df["__acct_key__"] = df[acct_id_col].astype(str).str.replace(r"[^0-9]", "", regex=True)
         else:
             df["__acct_key__"] = ""
-        # Prefer mapping by AccountID if available
-        if acct_id_col and acct_to_tabs_id:
-            df["customer_id"] = df["__acct_key__"].map(acct_to_tabs_id)
-        else:
-            df["__join_key__"] = df["AccountName"].astype(str).str.lower().str.replace(r"[^a-z0-9]", "", regex=True)
-            df["customer_id"] = df["__join_key__"].map(parent_to_id)
-        # Do NOT call APIs in the Usage tab; leave customer_id blank if only NetSuite ID exists.
+        # Don't map customer_id before grouping - we'll do it after grouping
+        # This avoids issues with None values and ensures the mapping works on grouped data
+        # Leave customer_id blank if AccountID mapping is not available.
         # IMPORTANT: Do not group by customer_id (it may be NaN and would drop all rows).
         group_keys = ["AccountName", "__acct_key__"]
         agg_dict = {"value": "sum", datetime_col: "max"}
@@ -985,11 +1556,23 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_clients=None, resol
         # Map customer_id after grouping when available from mapping (name or acct)
         grouped["__join_key__"] = grouped["AccountName"].astype(str).str.lower().str.replace(r"[^a-z0-9]", "", regex=True)
         name_mapped = grouped["__join_key__"].map(parent_to_id) if 'parent_to_id' in locals() or 'parent_to_id' in globals() else None
-        acct_mapped = grouped["__acct_key__"].map(acct_to_tabs_id) if 'acct_to_tabs_id' in locals() else None
-        if acct_mapped is not None:
+        
+        # Map customer_id from AccountID using Customer Number custom field
+        acct_mapped = None
+        if account_id_to_customer_from_custom_field and len(account_id_to_customer_from_custom_field) > 0:
+            acct_mapped = grouped["__acct_key__"].map(account_id_to_customer_from_custom_field)
+            
+        # Use AccountID mapping first, then fallback to name-based mapping
+        # Always ensure customer_id column exists
+        if acct_mapped is not None and len(acct_mapped) > 0 and acct_mapped.notna().any():
             grouped["customer_id"] = acct_mapped
-        if name_mapped is not None:
-            grouped["customer_id"] = grouped.get("customer_id").fillna(name_mapped) if "customer_id" in grouped.columns else name_mapped
+            if name_mapped is not None and len(name_mapped) > 0 and name_mapped.notna().any():
+                grouped["customer_id"] = grouped["customer_id"].fillna(name_mapped)
+        elif name_mapped is not None and len(name_mapped) > 0 and name_mapped.notna().any():
+            grouped["customer_id"] = name_mapped
+        else:
+            # If no mapping worked, create empty customer_id column with NaN
+            grouped["customer_id"] = pd.NA
 
         grouped["event_type_name"] = event_type_name
         # Differentiator: will be set later for Finastra only
@@ -1011,9 +1594,195 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_clients=None, resol
     income_df = pd.read_csv(uploaded_income)
     lbpa_df = pd.read_csv(uploaded_lbpa)
     
-    # Debug: Track Income and LBPA rows before processing
-    income_initial_count = len(income_df)
-    lbpa_initial_count = len(lbpa_df)
+    # Build AccountID to customer_id mapping from customer file if provided
+    # Also build AccountID + AccountName to customer_id mapping for cases where same customer has multiple AccountIDs
+    # Also build AccountName to customer_id mapping for cases where AccountID doesn't match but name does
+    account_id_to_customer_from_file = {}
+    account_id_name_to_customer_from_file = {}  # Key: (account_id, normalized_name) -> customer_id
+    account_name_to_customer_from_file = {}  # Key: normalized_name -> customer_id (for name-based matching)
+    finastra_customer_id_from_file = None  # Hardcoded fallback for Finastra rows
+    
+    # Customer file is required
+    try:
+        customer_df = pd.read_csv(uploaded_customer)
+        if "ID" in customer_df.columns and "Customer Number" in customer_df.columns:
+            # Create mapping from Customer Number (AccountID) to ID (customer_id)
+            # Also create mapping from AccountID + Name to customer_id for multi-account customers
+            # Get Name column if available
+            name_col = "Name" if "Name" in customer_df.columns else None
+            
+            # Only use customers with "- NMS" in their name
+            if name_col:
+                customer_df = customer_df[customer_df[name_col].astype(str).str.contains("- NMS", case=False, na=False)]
+            
+            valid_rows = customer_df[["ID", "Customer Number"]].dropna()
+            valid_rows = valid_rows[valid_rows["Customer Number"].astype(str).str.strip() != ""]
+            
+            for _, row in valid_rows.iterrows():
+                # Extract numeric AccountID (remove all non-numeric characters)
+                # Handle both string and numeric types
+                customer_number_raw = row["Customer Number"]
+                
+                # If it's a float (like 4702.0), convert to int first to remove decimal
+                if isinstance(customer_number_raw, (int, float)):
+                    customer_number_str = str(int(customer_number_raw))
+                else:
+                    customer_number_str = str(customer_number_raw).strip()
+                
+                # Remove all non-numeric characters (shouldn't be needed if already numeric, but safe)
+                account_id = re.sub(r"[^0-9]", "", customer_number_str)
+                customer_id = str(row["ID"]).strip()
+                
+                if account_id and customer_id:
+                    # Store AccountID -> customer_id mapping (for direct AccountID matches)
+                    account_id_to_customer_from_file[account_id] = customer_id
+                    
+                    # Also store AccountID + Name -> customer_id mapping (for cases where same customer has multiple AccountIDs)
+                    if name_col and name_col in row:
+                        customer_name = str(row[name_col]).strip()
+                        if customer_name:
+                            # Normalize name for matching
+                            normalized_name = re.sub(r"[^a-z0-9]", "", customer_name.lower())
+                            account_id_name_to_customer_from_file[(account_id, normalized_name)] = customer_id
+                            
+                            # Also store Name -> customer_id mapping (for cases where AccountID doesn't match but name does)
+                            # This handles Finastra case where multiple AccountIDs map to same customer
+                            # Use the first customer_id we find for this name (they should all be the same)
+                            if normalized_name not in account_name_to_customer_from_file:
+                                account_name_to_customer_from_file[normalized_name] = customer_id
+                            
+                            # Also store base name (before " - " or similar separators) for partial matching
+                            # This handles "Finastra - NMS" vs "Finastra" cases
+                            base_name = customer_name.split(" - ")[0].split(" – ")[0].split("-")[0].strip()
+                            base_normalized = re.sub(r"[^a-z0-9]", "", base_name.lower())
+                            if base_normalized and base_normalized != normalized_name and len(base_normalized) >= 3:
+                                if base_normalized not in account_name_to_customer_from_file:
+                                    account_name_to_customer_from_file[base_normalized] = customer_id
+            
+            # Check for customers with multiple AccountIDs (same customer_id, different AccountIDs)
+            customer_to_account_ids = {}
+            for account_id, customer_id in account_id_to_customer_from_file.items():
+                if customer_id not in customer_to_account_ids:
+                    customer_to_account_ids[customer_id] = []
+                customer_to_account_ids[customer_id].append(account_id)
+            
+            # Find Finastra customer_id for hardcoded fallback (must have "- NMS" in name)
+            if "Name" in customer_df.columns:
+                finastra_rows = customer_df[
+                    customer_df["Name"].astype(str).str.contains("Finastra", case=False, na=False) &
+                    customer_df["Name"].astype(str).str.contains("- NMS", case=False, na=False)
+                ]
+                if len(finastra_rows) > 0:
+                    finastra_customer_id_from_file = str(finastra_rows.iloc[0]["ID"]).strip()
+            
+            # Backfill AccountIDs for customers that have Name but no AccountID
+            # Match by name to income/LBPA files and extract AccountID
+            if name_col:
+                customers_without_accountid = customer_df[
+                    (customer_df["Customer Number"].isna()) | 
+                    (customer_df["Customer Number"].astype(str).str.strip() == "") |
+                    (customer_df["Customer Number"].astype(str).str.strip().str.lower() == "nan")
+                ]
+                
+                if len(customers_without_accountid) > 0:
+                    # Build name to AccountID mapping from income/LBPA files
+                    name_to_accountid_from_files = {}
+                    
+                    # Check income file
+                    if "AccountID" in income_df.columns:
+                        name_col_income = "CustomerName" if "CustomerName" in income_df.columns else "AccountName"
+                        if name_col_income in income_df.columns:
+                            for _, row in income_df.iterrows():
+                                account_id_raw = row.get("AccountID")
+                                account_name = str(row.get(name_col_income, "")).strip()
+                                if account_id_raw and account_name:
+                                    account_id = re.sub(r"[^0-9]", "", str(account_id_raw))
+                                    if account_id:
+                                        normalized_name = re.sub(r"[^a-z0-9]", "", account_name.lower())
+                                        # Store the first AccountID we find for this name
+                                        if normalized_name not in name_to_accountid_from_files:
+                                            name_to_accountid_from_files[normalized_name] = account_id
+                    
+                    # Check LBPA file
+                    if "AccountID" in lbpa_df.columns:
+                        name_col_lbpa = "CustomerName" if "CustomerName" in lbpa_df.columns else "AccountName"
+                        if name_col_lbpa in lbpa_df.columns:
+                            for _, row in lbpa_df.iterrows():
+                                account_id_raw = row.get("AccountID")
+                                account_name = str(row.get(name_col_lbpa, "")).strip()
+                                if account_id_raw and account_name:
+                                    account_id = re.sub(r"[^0-9]", "", str(account_id_raw))
+                                    if account_id:
+                                        normalized_name = re.sub(r"[^a-z0-9]", "", account_name.lower())
+                                        # Store the first AccountID we find for this name (don't overwrite if already exists)
+                                        if normalized_name not in name_to_accountid_from_files:
+                                            name_to_accountid_from_files[normalized_name] = account_id
+                    
+                    # Match customers without AccountID to files by name
+                    backfilled_count = 0
+                    api_updated_count = 0
+                    backfilled_customers = []
+                    for _, customer_row in customers_without_accountid.iterrows():
+                        customer_id = str(customer_row["ID"]).strip()
+                        customer_name = str(customer_row.get(name_col, "")).strip()
+                        
+                        if customer_id and customer_name:
+                            # Try to match by normalized name
+                            normalized_customer_name = re.sub(r"[^a-z0-9]", "", customer_name.lower())
+                            account_id = None
+                            
+                            if normalized_customer_name in name_to_accountid_from_files:
+                                account_id = name_to_accountid_from_files[normalized_customer_name]
+                            else:
+                                # Try base name matching (before " - " or similar)
+                                base_name = customer_name.split(" - ")[0].split(" – ")[0].split("-")[0].strip()
+                                base_normalized = re.sub(r"[^a-z0-9]", "", base_name.lower())
+                                if base_normalized in name_to_accountid_from_files:
+                                    account_id = name_to_accountid_from_files[base_normalized]
+                            
+                            if account_id:
+                                # Add to mapping
+                                account_id_to_customer_from_file[account_id] = customer_id
+                                backfilled_count += 1
+                                backfilled_customers.append((customer_name, account_id))
+                                
+                                # Also update the custom field via API if API key is available
+                                # No need to check - we only backfill for customers without AccountID in customer file
+                                if get_api_key():
+                                    if update_customer_custom_field(customer_id, CUSTOMER_NUMBER_FIELD_ID, account_id):
+                                        api_updated_count += 1
+                    
+                    if backfilled_count > 0:
+                        st.write(f"✅ Backfilled {backfilled_count} AccountIDs from income/LBPA files for customers missing AccountID in customer file")
+                        if backfilled_customers:
+                            st.write(f"   Customers updated: {', '.join([f'{name} (AccountID: {acct})' for name, acct in backfilled_customers])}")
+                        if api_updated_count > 0:
+                            st.write(f"   ✅ Updated custom field via API for {api_updated_count} customers")
+    except Exception as e:
+        st.error(f"Error reading customer file: {str(e)}")
+        raise
+    
+    # Extract AccountIDs from uploaded files to only backfill relevant customers
+    account_ids_in_files = set()
+    if "AccountID" in income_df.columns:
+        income_account_ids = income_df["AccountID"].dropna().astype(str).str.replace(r"[^0-9]", "", regex=True)
+        account_ids_in_files.update(income_account_ids[income_account_ids.str.strip() != ""].tolist())
+    if "AccountID" in lbpa_df.columns:
+        lbpa_account_ids = lbpa_df["AccountID"].dropna().astype(str).str.replace(r"[^0-9]", "", regex=True)
+        account_ids_in_files.update(lbpa_account_ids[lbpa_account_ids.str.strip() != ""].tolist())
+    
+    # Check which AccountIDs from files are missing from customer mapping file
+    if account_id_to_customer_from_file and account_ids_in_files:
+        missing_account_ids = account_ids_in_files - set(account_id_to_customer_from_file.keys())
+    
+    # Build mapping from AccountID (Customer Number custom field) to customer_id
+    # Use customer file mapping only (no API fetching)
+    account_id_to_customer_from_custom_field = {}
+    
+    # If we have customer file mapping, use it as primary source
+    if account_id_to_customer_from_file:
+        account_id_to_customer_from_custom_field = account_id_to_customer_from_file.copy()
+        st.write(f"✅ Loaded {len(account_id_to_customer_from_custom_field):,} customer mappings from file")
 
     income_upload = process_usage(income_df, "Per Application",
                                   ["isinitialsubmission", "perapplication", "applicationcount"])
@@ -1060,43 +1829,30 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_clients=None, resol
     # LBPA mapping
     combined_internal.loc[lbpa_mask & (combined_internal["event_type_name"] == "Per Application"), "event_type_name"] = "LBPA app"
     combined_internal.loc[lbpa_mask & (combined_internal["event_type_name"] == "Units"), "event_type_name"] = "LBPA unit"
-
-    # Optional: resolve Tabs IDs now using NetSuite external IDs via API
-    if resolve_now and get_api_key():
-        # Build acct -> NS map from clients file
-        # Reuse acct_to_ns_id built earlier in this function
-        missing_mask = combined_internal["customer_id"].isna() | (combined_internal["customer_id"].astype(str).str.strip() == "")
-        if missing_mask.any():
-            acct_keys = combined_internal.loc[missing_mask, "account_id"].astype(str).str.replace(r"[^0-9]", "", regex=True)
-            ns_series = acct_keys.map(acct_to_ns_id)
-            unique_ns = sorted(x for x in ns_series.dropna().unique().tolist() if str(x).strip())
-            ns_to_tabs: dict[str, str] = {}
-            for ns in unique_ns:
-                tabs_id = resolve_tabs_id_from_ns(ns)
-                if tabs_id:
-                    ns_to_tabs[str(ns)] = tabs_id
-            if ns_to_tabs:
-                combined_internal.loc[missing_mask, "customer_id"] = ns_series.map(ns_to_tabs)
-    
-    # Optional: resolve Tabs IDs now using NetSuite external IDs via API
-    if resolve_now and get_api_key():
-        # Build acct -> NS map from clients file
-        # Reuse acct_to_ns_id built earlier in this function
-        missing_mask = combined_internal["customer_id"].isna() | (combined_internal["customer_id"].astype(str).str.strip() == "")
-        if missing_mask.any():
-            acct_keys = combined_internal.loc[missing_mask, "account_id"].astype(str).str.replace(r"[^0-9]", "", regex=True)
-            ns_series = acct_keys.map(acct_to_ns_id)
-            unique_ns = sorted(x for x in ns_series.dropna().unique().tolist() if str(x).strip())
-            ns_to_tabs: dict[str, str] = {}
-            for ns in unique_ns:
-                tabs_id = resolve_tabs_id_from_ns(ns)
-                if tabs_id:
-                    ns_to_tabs[str(ns)] = tabs_id
-            if ns_to_tabs:
-                combined_internal.loc[missing_mask, "customer_id"] = ns_series.map(ns_to_tabs)
     
     # Ensure customer_id is populated and string type AFTER resolution
     combined_internal["customer_id"] = combined_internal["customer_id"].astype(str)
+    
+    # Direct Finastra fallback: Apply Finastra customer_id to any Finastra rows that still don't have it
+    if finastra_customer_id_from_file:
+        # Check for Finastra rows by CustomerName or AccountName
+        name_col = None
+        if "CustomerName" in combined_internal.columns:
+            name_col = "CustomerName"
+        elif "AccountName" in combined_internal.columns:
+            name_col = "AccountName"
+        
+        if name_col:
+            finastra_mask = (
+                combined_internal[name_col].astype(str).str.contains("Finastra", case=False, na=False) &
+                (combined_internal["customer_id"].isna() | 
+                 (combined_internal["customer_id"] == "nan") |
+                 (combined_internal["customer_id"] == "None") |
+                 (combined_internal["customer_id"].str.strip() == ""))
+            )
+            if finastra_mask.any():
+                combined_internal.loc[finastra_mask, "customer_id"] = finastra_customer_id_from_file
+    
     valid_customer_mask = (
         (combined_internal["customer_id"] != "nan") &
         (combined_internal["customer_id"] != "None") &
@@ -1126,28 +1882,211 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_clients=None, resol
     income_df_with_customer = income_df.copy()
     lbpa_df_with_customer = lbpa_df.copy()
     
-    # Map customer_id to Income file using account_id from combined_internal mapping
-    if "AccountID" in income_df_with_customer.columns:
-        income_account_ids = income_df_with_customer["AccountID"].astype(str).str.replace(r"[^0-9]", "", regex=True)
-        if account_to_customer_mapping:
-            income_df_with_customer["customer_id"] = income_account_ids.map(account_to_customer_mapping)
-        else:
-            # Fallback: try using acct_to_tabs_id if available
-            if acct_to_tabs_id:
-                income_df_with_customer["customer_id"] = income_account_ids.map(acct_to_tabs_id)
-            else:
+    # Map customer_id to Income file using CustomerNumber column - prefer Customer Number column from customer file
+    if "CustomerNumber" in income_df_with_customer.columns:
+        income_account_ids = income_df_with_customer["CustomerNumber"].apply(extract_account_id_from_customer_number)
+        # First try customer file mapping (primary method - Customer Number column)
+        # Since all historical AccountIDs are set and new ones will sync automatically, prioritize file mapping
+        if account_id_to_customer_from_file:
+            unique_income_account_ids = income_account_ids[income_account_ids != ""].unique()
+            matching_account_ids = [aid for aid in unique_income_account_ids if aid in account_id_to_customer_from_file]
+            income_df_with_customer["customer_id"] = income_account_ids.map(account_id_to_customer_from_file)
+            # Count how many were actually matched
+            income_matched = income_df_with_customer["customer_id"].notna().sum()
+            income_total = len(income_df_with_customer)
+        
+        # Then try Customer Number custom field mapping as fallback (for unmapped AccountIDs)
+        if account_id_to_customer_from_custom_field and income_df_with_customer["customer_id"].isna().any():
+            unmapped_mask = income_df_with_customer["customer_id"].isna() & income_df_with_customer["CustomerNumber"].notna()
+            if unmapped_mask.any():
+                unmapped_account_ids = income_df_with_customer.loc[unmapped_mask, "CustomerNumber"].apply(extract_account_id_from_customer_number)
+                mapped = unmapped_account_ids.map(account_id_to_customer_from_custom_field)
+                income_df_with_customer.loc[unmapped_mask, "customer_id"] = mapped
+        
+        # Continue with additional fallback matching (AccountID + AccountName, name matching, etc.)
+        if account_id_to_customer_from_file and income_df_with_customer["customer_id"].isna().any():
+            # For unmapped AccountIDs, try AccountID + AccountName matching
+            # This handles the case where a customer (like Finastra) has multiple AccountIDs, each with a different AccountName
+            unmapped_mask = income_df_with_customer["customer_id"].isna() & income_df_with_customer["CustomerNumber"].notna()
+            if unmapped_mask.any():
+                unmapped_rows = income_df_with_customer[unmapped_mask].copy()
+                
+                # First try AccountID + AccountName matching (if available)
+                if account_id_name_to_customer_from_file and "AccountName" in income_df_with_customer.columns:
+                    for idx, row in unmapped_rows.iterrows():
+                        account_id = extract_account_id_from_customer_number(row["CustomerNumber"])
+                        account_name = str(row.get("AccountName", "")).strip()
+                        
+                        if account_id and account_name:
+                            # Normalize name for matching
+                            normalized_name = re.sub(r"[^a-z0-9]", "", account_name.lower())
+                            # Try to find match using AccountID + AccountName
+                            if (account_id, normalized_name) in account_id_name_to_customer_from_file:
+                                income_df_with_customer.loc[idx, "customer_id"] = account_id_name_to_customer_from_file[(account_id, normalized_name)]
+                
+                # Fallback: If AccountID exists in customer file but AccountName doesn't match,
+                # still use the customer_id (for cases where same customer has multiple AccountIDs)
+                # This handles Finastra case where AccountID might match but AccountName format differs
+                still_unmapped_mask = income_df_with_customer["customer_id"].isna() & income_df_with_customer["CustomerNumber"].notna()
+                if still_unmapped_mask.any() and account_id_to_customer_from_file:
+                    still_unmapped = income_df_with_customer[still_unmapped_mask].copy()
+                    matched_count = 0
+                    for idx, row in still_unmapped.iterrows():
+                        account_id = extract_account_id_from_customer_number(row["CustomerNumber"])
+                        # If AccountID exists in customer file, use it (even if AccountName doesn't match)
+                        if account_id and account_id in account_id_to_customer_from_file:
+                            income_df_with_customer.loc[idx, "customer_id"] = account_id_to_customer_from_file[account_id]
+                            matched_count += 1
+                    if matched_count > 0:
+                        st.write(f"   ✅ Matched {matched_count} additional rows using AccountID fallback")
+                    
+                    # Final fallback: Match by AccountName if AccountID doesn't match
+                    # This handles cases like Finastra where multiple AccountIDs map to same customer
+                    still_unmapped_after = income_df_with_customer[income_df_with_customer["customer_id"].isna() & income_df_with_customer["CustomerNumber"].notna()]
+                    if len(still_unmapped_after) > 0 and account_name_to_customer_from_file and "AccountName" in income_df_with_customer.columns:
+                        name_matched_count = 0
+                        for idx, row in still_unmapped_after.iterrows():
+                            account_name = str(row.get("AccountName", "")).strip()
+                            if account_name:
+                                # Try full normalized name first
+                                normalized_name = re.sub(r"[^a-z0-9]", "", account_name.lower())
+                                if normalized_name in account_name_to_customer_from_file:
+                                    income_df_with_customer.loc[idx, "customer_id"] = account_name_to_customer_from_file[normalized_name]
+                                    name_matched_count += 1
+                                else:
+                                    # Try base name (before " - " or similar separators)
+                                    base_name = account_name.split(" - ")[0].split(" – ")[0].split("-")[0].strip()
+                                    base_normalized = re.sub(r"[^a-z0-9]", "", base_name.lower())
+                                    if base_normalized in account_name_to_customer_from_file:
+                                        income_df_with_customer.loc[idx, "customer_id"] = account_name_to_customer_from_file[base_normalized]
+                                        name_matched_count += 1
+                        if name_matched_count > 0:
+                            st.write(f"   ✅ Matched {name_matched_count} additional rows using AccountName matching")
+                    
+                    # Hardcoded fallback: Match Finastra rows to Finastra customer_id from customer file
+                    # This handles cases where Finastra has multiple AccountIDs not in the customer file
+                    if finastra_customer_id_from_file:
+                        # Check both CustomerName and AccountName columns
+                        name_col = "CustomerName" if "CustomerName" in income_df_with_customer.columns else "AccountName"
+                        if name_col in income_df_with_customer.columns:
+                            finastra_mask = income_df_with_customer[name_col].astype(str).str.contains("Finastra", case=False, na=False) & income_df_with_customer["customer_id"].isna()
+                            finastra_count = finastra_mask.sum()
+                            if finastra_count > 0:
+                                income_df_with_customer.loc[finastra_mask, "customer_id"] = finastra_customer_id_from_file
+        # Then try account_to_customer_mapping from combined_internal (only if CustomerNumber column exists)
+        if account_to_customer_mapping and "CustomerNumber" in income_df_with_customer.columns:
+            if "customer_id" not in income_df_with_customer.columns:
+                income_df_with_customer["customer_id"] = None
+            income_account_ids_for_mapping = income_df_with_customer["CustomerNumber"].apply(extract_account_id_from_customer_number)
+            income_df_with_customer["customer_id"] = income_df_with_customer["customer_id"].fillna(
+                income_account_ids_for_mapping.map(account_to_customer_mapping)
+            )
+        if "customer_id" not in income_df_with_customer.columns:
                 income_df_with_customer["customer_id"] = None
     
-    # Map customer_id to LBPA file using account_id from combined_internal mapping
-    if "AccountID" in lbpa_df_with_customer.columns:
-        lbpa_account_ids = lbpa_df_with_customer["AccountID"].astype(str).str.replace(r"[^0-9]", "", regex=True)
+    # Map customer_id to LBPA file using CustomerNumber column - prefer Customer Number column from customer file
+    if "CustomerNumber" in lbpa_df_with_customer.columns:
+        lbpa_account_ids = lbpa_df_with_customer["CustomerNumber"].apply(extract_account_id_from_customer_number)
+        # First try customer file mapping (primary method - Customer Number column)
+        # Since all historical AccountIDs are set and new ones will sync automatically, prioritize file mapping
+        if account_id_to_customer_from_file:
+            lbpa_df_with_customer["customer_id"] = lbpa_account_ids.map(account_id_to_customer_from_file)
+            # Count how many were actually matched
+            lbpa_matched = lbpa_df_with_customer["customer_id"].notna().sum()
+            lbpa_total = len(lbpa_df_with_customer)
+        
+        # Then try Customer Number custom field mapping as fallback (for unmapped AccountIDs)
+        if account_id_to_customer_from_custom_field and lbpa_df_with_customer["customer_id"].isna().any():
+            unmapped_mask = lbpa_df_with_customer["customer_id"].isna() & lbpa_df_with_customer["CustomerNumber"].notna()
+            if unmapped_mask.any():
+                unmapped_account_ids = lbpa_df_with_customer.loc[unmapped_mask, "CustomerNumber"].apply(extract_account_id_from_customer_number)
+                mapped = unmapped_account_ids.map(account_id_to_customer_from_custom_field)
+                lbpa_df_with_customer.loc[unmapped_mask, "customer_id"] = mapped
+        
+        # Continue with additional fallback matching (AccountID + AccountName, name matching, etc.)
+        if account_id_to_customer_from_file and lbpa_df_with_customer["customer_id"].isna().any():
+            unmapped_mask = lbpa_df_with_customer["customer_id"].isna() & lbpa_df_with_customer["CustomerNumber"].notna()
+            if unmapped_mask.any():
+                unmapped_account_ids = lbpa_df_with_customer.loc[unmapped_mask, "CustomerNumber"].apply(extract_account_id_from_customer_number)
+                mapped = unmapped_account_ids.map(account_id_to_customer_from_file)
+                lbpa_df_with_customer.loc[unmapped_mask, "customer_id"] = mapped
+            
+            # For unmapped AccountIDs, try AccountID + AccountName matching
+            # This handles the case where a customer (like Finastra) has multiple AccountIDs, each with a different AccountName
+            unmapped_mask = lbpa_df_with_customer["customer_id"].isna() & lbpa_df_with_customer["CustomerNumber"].notna()
+            if unmapped_mask.any():
+                unmapped_rows = lbpa_df_with_customer[unmapped_mask].copy()
+                
+                # First try AccountID + AccountName matching (if available)
+                if account_id_name_to_customer_from_file and "AccountName" in lbpa_df_with_customer.columns:
+                    for idx, row in unmapped_rows.iterrows():
+                        account_id_raw = row["CustomerNumber"]
+                        account_id = re.sub(r"[^0-9]", "", str(account_id_raw)) if pd.notna(account_id_raw) else ""
+                        account_name = str(row.get("AccountName", "")).strip()
+                        
+                        if account_id and account_name:
+                            # Normalize name for matching
+                            normalized_name = re.sub(r"[^a-z0-9]", "", account_name.lower())
+                            # Try to find match using AccountID + AccountName
+                            if (account_id, normalized_name) in account_id_name_to_customer_from_file:
+                                lbpa_df_with_customer.loc[idx, "customer_id"] = account_id_name_to_customer_from_file[(account_id, normalized_name)]
+                
+                # Fallback: If AccountID exists in customer file but AccountName doesn't match,
+                # still use the customer_id (for cases where same customer has multiple AccountIDs)
+                # This handles Finastra case where AccountID might match but AccountName format differs
+                still_unmapped_mask = lbpa_df_with_customer["customer_id"].isna() & lbpa_df_with_customer["CustomerNumber"].notna()
+                if still_unmapped_mask.any() and account_id_to_customer_from_file:
+                    still_unmapped = lbpa_df_with_customer[still_unmapped_mask].copy()
+                    matched_count = 0
+                    for idx, row in still_unmapped.iterrows():
+                        account_id = extract_account_id_from_customer_number(row["CustomerNumber"])
+                        # If AccountID exists in customer file, use it (even if AccountName doesn't match)
+                        if account_id and account_id in account_id_to_customer_from_file:
+                            lbpa_df_with_customer.loc[idx, "customer_id"] = account_id_to_customer_from_file[account_id]
+                            matched_count += 1
+                    if matched_count > 0:
+                        st.write(f"   ✅ Matched {matched_count} additional LBPA rows using AccountID fallback")
+                
+                # Final fallback: Match by AccountName if AccountID doesn't match
+                # This handles cases like Finastra where multiple AccountIDs map to same customer
+                still_unmapped_after = lbpa_df_with_customer[lbpa_df_with_customer["customer_id"].isna() & lbpa_df_with_customer["CustomerNumber"].notna()]
+                if len(still_unmapped_after) > 0 and account_name_to_customer_from_file and "AccountName" in lbpa_df_with_customer.columns:
+                    name_matched_count = 0
+                    for idx, row in still_unmapped_after.iterrows():
+                        account_name = str(row.get("AccountName", "")).strip()
+                        if account_name:
+                            # Try full normalized name first
+                            normalized_name = re.sub(r"[^a-z0-9]", "", account_name.lower())
+                            if normalized_name in account_name_to_customer_from_file:
+                                lbpa_df_with_customer.loc[idx, "customer_id"] = account_name_to_customer_from_file[normalized_name]
+                                name_matched_count += 1
+                            else:
+                                # Try base name (before " - " or similar separators)
+                                base_name = account_name.split(" - ")[0].split(" – ")[0].split("-")[0].strip()
+                                base_normalized = re.sub(r"[^a-z0-9]", "", base_name.lower())
+                                if base_normalized in account_name_to_customer_from_file:
+                                    lbpa_df_with_customer.loc[idx, "customer_id"] = account_name_to_customer_from_file[base_normalized]
+                                    name_matched_count += 1
+                    if name_matched_count > 0:
+                        st.write(f"   ✅ Matched {name_matched_count} additional LBPA rows using AccountName matching")
+                
+                # Hardcoded fallback: Match Finastra rows to Finastra customer_id from customer file
+                if finastra_customer_id_from_file:
+                    # Check both CustomerName and AccountName columns
+                    name_col = "CustomerName" if "CustomerName" in lbpa_df_with_customer.columns else "AccountName"
+                    if name_col in lbpa_df_with_customer.columns:
+                        finastra_mask = lbpa_df_with_customer[name_col].astype(str).str.contains("Finastra", case=False, na=False) & lbpa_df_with_customer["customer_id"].isna()
+                        finastra_count = finastra_mask.sum()
+                        if finastra_count > 0:
+                            lbpa_df_with_customer.loc[finastra_mask, "customer_id"] = finastra_customer_id_from_file
+        # Then try account_to_customer_mapping from combined_internal
         if account_to_customer_mapping:
-            lbpa_df_with_customer["customer_id"] = lbpa_account_ids.map(account_to_customer_mapping)
-        else:
-            # Fallback: try using acct_to_tabs_id if available
-            if acct_to_tabs_id:
-                lbpa_df_with_customer["customer_id"] = lbpa_account_ids.map(acct_to_tabs_id)
-            else:
+            if "customer_id" not in lbpa_df_with_customer.columns:
+                lbpa_df_with_customer["customer_id"] = None
+            lbpa_df_with_customer["customer_id"] = lbpa_df_with_customer["customer_id"].fillna(
+                lbpa_account_ids.map(account_to_customer_mapping)
+            )
+        if "customer_id" not in lbpa_df_with_customer.columns:
                 lbpa_df_with_customer["customer_id"] = None
     
     # If customer_id still missing, try mapping by customer name using parent_to_id
@@ -1179,6 +2118,88 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_clients=None, resol
         lbpa_df_with_customer["customer_id"] = lbpa_df_with_customer["customer_id"].astype(str)
     else:
         lbpa_df_with_customer["customer_id"] = None
+    
+    # Transfer customer_id from income_df_with_customer to income_upload (after all mapping is done)
+    # Match by CustomerNumber (extracted as AccountID) to preserve customer_id mapping
+    # This is important because the mapping was done using CustomerNumber, not AccountID
+    if "CustomerNumber" in income_df_with_customer.columns and "account_id" in income_upload.columns:
+        # Create mapping from account_id (extracted from CustomerNumber) to customer_id
+        # Only include rows that have a valid customer_id, and take the first non-null value for each AccountID
+        account_to_customer = {}
+        for idx, row in income_df_with_customer.iterrows():
+            # Use CustomerNumber (not AccountID) since that's what we mapped with
+            account_id = extract_account_id_from_customer_number(row["CustomerNumber"]) if pd.notna(row["CustomerNumber"]) else ""
+            customer_id = row.get("customer_id")
+            # Only add if we have both account_id and customer_id, and haven't seen this account_id yet
+            if account_id and pd.notna(customer_id) and customer_id not in ["nan", "None", ""] and account_id not in account_to_customer:
+                account_to_customer[account_id] = customer_id
+        
+        # Also apply Finastra hardcoded mapping if needed
+        if finastra_customer_id_from_file:
+            # Find all Finastra AccountIDs in income_df_with_customer and add them to mapping
+            name_col = "CustomerName" if "CustomerName" in income_df_with_customer.columns else "AccountName"
+            if name_col in income_df_with_customer.columns:
+                finastra_mask = income_df_with_customer[name_col].astype(str).str.contains("Finastra", case=False, na=False)
+                finastra_rows = income_df_with_customer[finastra_mask]
+                for idx, row in finastra_rows.iterrows():
+                    # Use CustomerNumber (not AccountID) since that's what we mapped with
+                    account_id = extract_account_id_from_customer_number(row["CustomerNumber"]) if pd.notna(row["CustomerNumber"]) else ""
+                    if account_id:
+                        account_to_customer[account_id] = finastra_customer_id_from_file
+        
+        # Map customer_id to income_upload
+        income_upload["customer_id"] = income_upload["account_id"].astype(str).map(account_to_customer)
+        
+        # Final fallback: if still missing and it's Finastra, apply directly
+        if finastra_customer_id_from_file and "CustomerName" in income_upload.columns:
+            finastra_mask = income_upload["CustomerName"].astype(str).str.contains("Finastra", case=False, na=False) & income_upload["customer_id"].isna()
+            if finastra_mask.any():
+                income_upload.loc[finastra_mask, "customer_id"] = finastra_customer_id_from_file
+    elif "customer_id" in income_df_with_customer.columns:
+        # Fallback: if no AccountID, try to match by index (assuming same order)
+        if len(income_df_with_customer) == len(income_df):
+            income_upload["customer_id"] = income_df_with_customer["customer_id"].values
+    
+    # Transfer customer_id from lbpa_df_with_customer to lbpa_upload (after all mapping is done)
+    # Match by CustomerNumber (extracted as AccountID) to preserve customer_id mapping
+    # This is important because the mapping was done using CustomerNumber, not AccountID
+    if "CustomerNumber" in lbpa_df_with_customer.columns and "account_id" in lbpa_upload.columns:
+        # Create mapping from account_id (extracted from CustomerNumber) to customer_id
+        # Only include rows that have a valid customer_id, and take the first non-null value for each AccountID
+        account_to_customer = {}
+        for idx, row in lbpa_df_with_customer.iterrows():
+            # Use CustomerNumber (not AccountID) since that's what we mapped with
+            account_id = extract_account_id_from_customer_number(row["CustomerNumber"]) if pd.notna(row["CustomerNumber"]) else ""
+            customer_id = row.get("customer_id")
+            # Only add if we have both account_id and customer_id, and haven't seen this account_id yet
+            if account_id and pd.notna(customer_id) and customer_id not in ["nan", "None", ""] and account_id not in account_to_customer:
+                account_to_customer[account_id] = customer_id
+        
+        # Also apply Finastra hardcoded mapping if needed
+        if finastra_customer_id_from_file:
+            # Find all Finastra AccountIDs in lbpa_df_with_customer and add them to mapping
+            name_col = "CustomerName" if "CustomerName" in lbpa_df_with_customer.columns else "AccountName"
+            if name_col in lbpa_df_with_customer.columns:
+                finastra_mask = lbpa_df_with_customer[name_col].astype(str).str.contains("Finastra", case=False, na=False)
+                finastra_rows = lbpa_df_with_customer[finastra_mask]
+                for idx, row in finastra_rows.iterrows():
+                    # Use CustomerNumber (not AccountID) since that's what we mapped with
+                    account_id = extract_account_id_from_customer_number(row["CustomerNumber"]) if pd.notna(row["CustomerNumber"]) else ""
+                    if account_id:
+                        account_to_customer[account_id] = finastra_customer_id_from_file
+        
+        # Map customer_id to lbpa_upload
+        lbpa_upload["customer_id"] = lbpa_upload["account_id"].astype(str).map(account_to_customer)
+        
+        # Final fallback: if still missing and it's Finastra, apply directly
+        if finastra_customer_id_from_file and "CustomerName" in lbpa_upload.columns:
+            finastra_mask = lbpa_upload["CustomerName"].astype(str).str.contains("Finastra", case=False, na=False) & lbpa_upload["customer_id"].isna()
+            if finastra_mask.any():
+                lbpa_upload.loc[finastra_mask, "customer_id"] = finastra_customer_id_from_file
+    elif "customer_id" in lbpa_df_with_customer.columns:
+        # Fallback: if no AccountID, try to match by index (assuming same order)
+        if len(lbpa_df_with_customer) == len(lbpa_df):
+            lbpa_upload["customer_id"] = lbpa_df_with_customer["customer_id"].values
     
     income_valid_mask = (
         income_df_with_customer["customer_id"].notna() &
@@ -1382,6 +2403,28 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_clients=None, resol
     
     # Set differentiator to empty for non-Finastra customers
     combined_internal.loc[~finastra_mask, "differentiator"] = ""
+    
+    # Initialize invoice column
+    combined_internal["invoice"] = ""
+    
+    # Handle split invoices if enabled
+    if split_customers and len(split_customers) > 0:
+        # Apply split numbering to selected customers (by CustomerName)
+        for customer_name in split_customers:
+            # Get all rows for this customer by matching CustomerName
+            customer_mask = combined_internal["CustomerName"].astype(str).str.strip() == str(customer_name).strip()
+            customer_data = combined_internal[customer_mask]
+            
+            if len(customer_data) > 0:
+                # Get all row indices for this customer (don't group by date)
+                customer_indices = customer_data.index.tolist()
+                
+                # Apply numbering: blank, 1, 2, 3... for all rows of this customer
+                for i, idx in enumerate(customer_indices):
+                    if i == 0:
+                        combined_internal.loc[idx, "invoice"] = ""  # First row blank
+                    else:
+                        combined_internal.loc[idx, "invoice"] = str(i)  # Subsequent rows: 1, 2, 3...
 
     # Order/output columns to match Tabs expected headers
     upload_cols = [
@@ -1394,8 +2437,10 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_clients=None, resol
         "IsInitialSubmission",
         "value",
         "differentiator",
+        "invoice",
     ]
     
+    st.write("📊 Generating usage file...")
     # Separate unmapped rows (customer_id is missing AND CustomerName is still numeric/account ID)
     # Use the same logic as valid_customer_mask to identify invalid customer_ids
     customer_id_missing = (
@@ -1407,6 +2452,12 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_clients=None, resol
     customer_name_is_numeric = combined_internal["CustomerName"].astype(str).str.match(r'^\d+$', na=False)
     unmapped_mask = customer_id_missing & customer_name_is_numeric
     
+    # Show summary of mapping results
+    total_rows = len(combined_internal)
+    mapped_rows = total_rows - customer_id_missing.sum()
+    unmapped_rows = customer_id_missing.sum()
+    if unmapped_rows > 0:
+        st.warning(f"⚠️ {unmapped_rows:,} of {total_rows:,} rows could not be matched to customer IDs")
     
     # Also check for rows with invalid customer_id (not just missing, but also "nan", "None", empty)
     invalid_customer_mask = (
@@ -1484,6 +2535,374 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_clients=None, resol
     st.session_state["original_income_df"] = income_df.copy()
     st.session_state["original_lbpa_df"] = lbpa_df.copy()
 
+    # Set Customer Number custom field using AccountID from income and lbpa files
+    # Strategy: 
+    # 1. Only set AccountID for customers that don't have it in customer file but appear in income/LBPA files
+    # 2. Use customer file as source of truth - if AccountID exists in file, assume it's already set in TABS
+    customer_account_mappings = {}
+    account_ids_without_customer_id = set()
+    
+    # Build set of customer_ids that already have AccountID in customer file (don't need to set)
+    customers_with_accountid_in_file = set()
+    if uploaded_customer:
+        try:
+            customer_df_check = pd.read_csv(uploaded_customer)
+            if "ID" in customer_df_check.columns and "Customer Number" in customer_df_check.columns:
+                name_col_check = "Name" if "Name" in customer_df_check.columns else None
+                # Only check - NMS customers
+                if name_col_check:
+                    customer_df_check = customer_df_check[customer_df_check[name_col_check].astype(str).str.contains("- NMS", case=False, na=False)]
+                
+                customers_with_accountid = customer_df_check[
+                    customer_df_check["Customer Number"].notna() &
+                    (customer_df_check["Customer Number"].astype(str).str.strip() != "") &
+                    (customer_df_check["Customer Number"].astype(str).str.strip().str.lower() != "nan")
+                ]
+                # Normalize customer IDs for comparison (strip whitespace, convert to string)
+                customers_with_accountid_in_file = set(
+                    customers_with_accountid["ID"].astype(str).str.strip().str.lower().tolist()
+                )
+                st.write(f"   ℹ️ Will skip {len(customers_with_accountid_in_file)} customers that already have AccountID in customer file")
+                if len(customers_with_accountid_in_file) > 0:
+                    sample_ids = list(customers_with_accountid_in_file)[:3]
+                    st.write(f"   Sample customer IDs to skip: {sample_ids}")
+        except Exception:
+            pass
+    
+    # Process income file
+    if "AccountID" in income_df_with_customer.columns:
+        if "customer_id" in income_df_with_customer.columns:
+            income_valid = income_df_with_customer[
+                income_df_with_customer["customer_id"].notna() &
+                (income_df_with_customer["customer_id"].astype(str).str.strip() != "") &
+                (income_df_with_customer["customer_id"].astype(str).str.strip().str.lower() != "nan") &
+                (income_df_with_customer["customer_id"].astype(str).str.strip() != "None") &
+                income_df_with_customer["AccountID"].notna()
+            ]
+            
+            skipped_count = 0
+            added_count = 0
+            sample_skipped = []
+            sample_added = []
+            for _, row in income_valid.iterrows():
+                customer_id = str(row["customer_id"]).strip().lower()
+                account_id = re.sub(r"[^0-9]", "", str(row["AccountID"]).strip())
+                if customer_id and account_id:
+                    # Only add to mappings if customer doesn't already have AccountID in customer file
+                    # Customer file represents what's already in TABS, so skip if AccountID exists in file
+                    if customer_id not in customers_with_accountid_in_file:
+                        # Store the mapping (customer_id -> account_id)
+                        # If multiple AccountIDs exist for same customer, we'll use the first one found
+                        if customer_id not in customer_account_mappings:
+                            customer_account_mappings[customer_id] = account_id
+                            added_count += 1
+                            if len(sample_added) < 3:
+                                sample_added.append(customer_id)
+                    else:
+                        # Customer already has AccountID in customer file, skip
+                        skipped_count += 1
+                        if len(sample_skipped) < 3:
+                            sample_skipped.append(customer_id)
+            if skipped_count > 0:
+                pass  # Don't show skipped - not relevant
+            if added_count > 0:
+                pass  # Don't show - this is for setting AccountIDs, not relevant to mapping
+        
+        # Also collect AccountIDs that don't have customer_id (for entityId lookup)
+        if "customer_id" in income_df_with_customer.columns:
+            income_missing = income_df_with_customer[
+                (income_df_with_customer["customer_id"].isna() |
+                 (income_df_with_customer["customer_id"].astype(str).str.strip() == "") |
+                 (income_df_with_customer["customer_id"].astype(str).str.strip().str.lower() == "nan") |
+                 (income_df_with_customer["customer_id"].astype(str).str.strip() == "None")) &
+                income_df_with_customer["AccountID"].notna()
+            ]
+            for _, row in income_missing.iterrows():
+                account_id = re.sub(r"[^0-9]", "", str(row["AccountID"]).strip())
+                if account_id:
+                    account_ids_without_customer_id.add(account_id)
+    
+    # Process lbpa file
+    if "AccountID" in lbpa_df_with_customer.columns:
+        if "customer_id" in lbpa_df_with_customer.columns:
+            lbpa_valid = lbpa_df_with_customer[
+                lbpa_df_with_customer["customer_id"].notna() &
+                (lbpa_df_with_customer["customer_id"].astype(str).str.strip() != "") &
+                (lbpa_df_with_customer["customer_id"].astype(str).str.strip().str.lower() != "nan") &
+                (lbpa_df_with_customer["customer_id"].astype(str).str.strip() != "None") &
+                lbpa_df_with_customer["AccountID"].notna()
+            ]
+            
+            skipped_count_lbpa = 0
+            added_count_lbpa = 0
+            for _, row in lbpa_valid.iterrows():
+                customer_id = str(row["customer_id"]).strip().lower()
+                account_id = re.sub(r"[^0-9]", "", str(row["AccountID"]).strip())
+                if customer_id and account_id:
+                    # Only add to mappings if customer doesn't already have AccountID in customer file
+                    # Customer file represents what's already in TABS, so skip if AccountID exists in file
+                    if customer_id not in customers_with_accountid_in_file:
+                        # Store the mapping (customer_id -> account_id)
+                        # If multiple AccountIDs exist for same customer, we'll use the first one found
+                        if customer_id not in customer_account_mappings:
+                            customer_account_mappings[customer_id] = account_id
+                            added_count_lbpa += 1
+                    else:
+                        # Customer already has AccountID in customer file, skip
+                        skipped_count_lbpa += 1
+            if skipped_count_lbpa > 0:
+                pass  # Don't show skipped - not relevant
+            if added_count_lbpa > 0:
+                pass  # Don't show - this is for setting AccountIDs, not relevant to mapping
+        
+        # Also collect AccountIDs that don't have customer_id (for entityId lookup)
+        if "customer_id" in lbpa_df_with_customer.columns:
+            lbpa_missing = lbpa_df_with_customer[
+                (lbpa_df_with_customer["customer_id"].isna() |
+                 (lbpa_df_with_customer["customer_id"].astype(str).str.strip() == "") |
+                 (lbpa_df_with_customer["customer_id"].astype(str).str.strip().str.lower() == "nan") |
+                 (lbpa_df_with_customer["customer_id"].astype(str).str.strip() == "None")) &
+                lbpa_df_with_customer["AccountID"].notna()
+            ]
+            for _, row in lbpa_missing.iterrows():
+                account_id = re.sub(r"[^0-9]", "", str(row["AccountID"]).strip())
+                if account_id:
+                    account_ids_without_customer_id.add(account_id)
+    
+    # Set AccountIDs for customers using mappings from income/LBPA files
+    # Use the customer_account_mappings we built from income/LBPA files
+    if uploaded_customer and get_api_key() and customer_account_mappings:
+        st.write("🔧 Setting AccountIDs for customers from income/LBPA files...")
+        try:
+            # Reset file pointer to beginning if it's been read before
+            if hasattr(uploaded_customer, 'seek'):
+                uploaded_customer.seek(0)
+            customer_df_sync = pd.read_csv(uploaded_customer)
+            if "ID" in customer_df_sync.columns and "Name" in customer_df_sync.columns:
+                name_col_sync = "Name"
+                # Only process - NMS customers
+                customer_df_sync = customer_df_sync[customer_df_sync[name_col_sync].astype(str).str.contains("- NMS", case=False, na=False)]
+                
+                success_count = 0
+                error_count = 0
+                skipped_count = 0
+                updated_customers = []
+                total_customers = len(customer_df_sync)
+                
+                st.write(f"   Processing {total_customers} customers from customer file...")
+                
+                for i, row in customer_df_sync.iterrows():
+                    customer_id = str(row["ID"]).strip()
+                    customer_name = str(row.get(name_col_sync, customer_id)).strip()
+                    
+                    if not customer_id:
+                        continue
+                    
+                    # Check if customer already has AccountID in customer file
+                    customer_number = row.get("Customer Number", "")
+                    if pd.notna(customer_number) and str(customer_number).strip() and str(customer_number).strip().lower() != "nan":
+                        # Already has AccountID in customer file, skip
+                        skipped_count += 1
+                        continue
+                    
+                    # Check if we have an AccountID mapping for this customer from income/LBPA files
+                    customer_id_normalized = customer_id.strip().lower()
+                    if customer_id_normalized in customer_account_mappings:
+                        account_id = customer_account_mappings[customer_id_normalized]
+                        # Set AccountID in TABS custom field
+                        if update_customer_custom_field(customer_id, CUSTOMER_NUMBER_FIELD_ID, account_id):
+                            success_count += 1
+                            updated_customers.append((customer_name, account_id))
+                            if i < 10:  # Show first 10 for visibility
+                                st.write(f"   ✅ Set AccountID {account_id} for {customer_name}")
+                        else:
+                            error_count += 1
+                            if i < 3:
+                                st.write(f"   ⚠️ Failed to set AccountID {account_id} for {customer_name}")
+                    
+                    # Show progress every 50 customers
+                    if (i + 1) % 50 == 0 or (i + 1) == total_customers:
+                        st.write(f"   ⏳ Processed {i + 1}/{total_customers} customers (updated: {success_count}, skipped: {skipped_count}, errors: {error_count})...")
+                
+                if success_count > 0:
+                    st.write(f"✅ Customer Number custom field updated for {success_count} customers from income/LBPA files")
+                    if updated_customers:
+                        customer_list = [f"{name} (AccountID: {acct})" for name, acct in updated_customers[:20]]
+                        st.write(f"   Updated customers: {', '.join(customer_list)}")
+                        if len(updated_customers) > 20:
+                            st.write(f"   ... and {len(updated_customers) - 20} more")
+                if skipped_count > 0:
+                    st.write(f"   ℹ️ Skipped {skipped_count} customers that already have AccountID in customer file")
+                if error_count > 0:
+                    st.write(f"   ⚠️ Failed to update {error_count} customers")
+        except Exception as e:
+            st.write(f"⚠️ Error setting AccountIDs from income/LBPA files: {str(e)}")
+    
+    # AccountID setting is done using mappings from income/LBPA files
+    # These mappings are built by matching AccountIDs in income/LBPA files to customer IDs
+    
+    # Handle customers in income/LBPA files that don't have AccountID set in customer file
+    # These customers are already in the customer file but their "Customer Number" column is empty
+    # Find them by name in TABS (only "- NMS" customers) and set their AccountID
+    # Only set AccountID if customer doesn't already have it in customer file
+    if get_api_key() and account_ids_without_customer_id:
+        st.write(f"🔍 Searching TABS for {len(account_ids_without_customer_id)} AccountIDs that couldn't be mapped...")
+        
+        # Build name to AccountID mapping from unmapped rows
+        name_to_accountid_unmapped = {}
+        
+        # Collect from income file
+        if "AccountID" in income_df_with_customer.columns:
+            income_unmapped = income_df_with_customer[
+                (income_df_with_customer["customer_id"].isna() |
+                 (income_df_with_customer["customer_id"].astype(str).str.strip() == "") |
+                 (income_df_with_customer["customer_id"].astype(str).str.strip().str.lower() == "nan") |
+                 (income_df_with_customer["customer_id"].astype(str).str.strip() == "None")) &
+                income_df_with_customer["AccountID"].notna()
+            ]
+            
+            name_col_income = "CustomerName" if "CustomerName" in income_unmapped.columns else "AccountName"
+            if name_col_income in income_unmapped.columns:
+                for _, row in income_unmapped.iterrows():
+                    account_id_raw = row.get("AccountID")
+                    account_name = str(row.get(name_col_income, "")).strip()
+                    if account_id_raw and account_name:
+                        account_id = re.sub(r"[^0-9]", "", str(account_id_raw))
+                        if account_id and account_id in account_ids_without_customer_id:
+                            normalized_name = re.sub(r"[^a-z0-9]", "", account_name.lower())
+                            # Store the first AccountID we find for this name
+                            if normalized_name not in name_to_accountid_unmapped:
+                                name_to_accountid_unmapped[normalized_name] = account_id
+        
+        # Collect from LBPA file
+        if "AccountID" in lbpa_df_with_customer.columns:
+            lbpa_unmapped = lbpa_df_with_customer[
+                (lbpa_df_with_customer["customer_id"].isna() |
+                 (lbpa_df_with_customer["customer_id"].astype(str).str.strip() == "") |
+                 (lbpa_df_with_customer["customer_id"].astype(str).str.strip().str.lower() == "nan") |
+                 (lbpa_df_with_customer["customer_id"].astype(str).str.strip() == "None")) &
+                lbpa_df_with_customer["AccountID"].notna()
+            ]
+            
+            name_col_lbpa = "CustomerName" if "CustomerName" in lbpa_unmapped.columns else "AccountName"
+            if name_col_lbpa in lbpa_unmapped.columns:
+                for _, row in lbpa_unmapped.iterrows():
+                    account_id_raw = row.get("AccountID")
+                    account_name = str(row.get(name_col_lbpa, "")).strip()
+                    if account_id_raw and account_name:
+                        account_id = re.sub(r"[^0-9]", "", str(account_id_raw))
+                        if account_id and account_id in account_ids_without_customer_id:
+                            normalized_name = re.sub(r"[^a-z0-9]", "", account_name.lower())
+                            # Store the first AccountID we find for this name (don't overwrite if already exists)
+                            if normalized_name not in name_to_accountid_unmapped:
+                                name_to_accountid_unmapped[normalized_name] = account_id
+        
+        # Search TABS for customers with matching names (only "- NMS" customers) and set AccountID
+        if name_to_accountid_unmapped:
+            api_key = get_api_key()
+            headers = {
+                "Authorization": f"{api_key}",
+                "Content-Type": "application/json"
+            }
+            
+            try:
+                import urllib3
+                urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+                
+                found_count = 0
+                updated_count = 0
+                new_customers_list = []
+                
+                # Fetch customers from TABS (only need to check names, so we can search)
+                url = f"{API_URL_BASE}"
+                page = 1
+                limit = 100
+                total_processed = 0
+                
+                st.write(f"   📡 Fetching customers from TABS API (searching for matching names)...")
+                while True:
+                    params = {"page": page, "limit": limit}
+                    res = requests.get(url, headers=headers, params=params, timeout=30, verify=False)
+                    
+                    if res.status_code != 200:
+                        break
+                    
+                    data = res.json()
+                    payload = data.get("payload", {})
+                    customers = payload.get("data", [])
+                    
+                    if not customers:
+                        break
+                    
+                    # Check each customer
+                    for customer in customers:
+                        customer_id = str(customer.get("id", "")).strip()
+                        customer_name = str(customer.get("name", "")).strip()
+                        
+                        # Only process customers with "- NMS" in their name
+                        if not customer_id or not customer_name or "- NMS" not in customer_name:
+                            continue
+                        
+                        # Try to match by normalized name
+                        normalized_customer_name = re.sub(r"[^a-z0-9]", "", customer_name.lower())
+                        
+                        if normalized_customer_name in name_to_accountid_unmapped:
+                            account_id = name_to_accountid_unmapped[normalized_customer_name]
+                            
+                            # Only set if customer doesn't already have AccountID in customer file
+                            if customer_id not in customers_with_accountid_in_file:
+                                found_count += 1
+                                
+                                # Set the AccountID custom field
+                                if update_customer_custom_field(customer_id, CUSTOMER_NUMBER_FIELD_ID, account_id):
+                                    updated_count += 1
+                                    new_customers_list.append((customer_name, account_id))
+                            
+                            # Remove from unmapped list since we found it (whether we set it or not)
+                            account_ids_without_customer_id.discard(account_id)
+                        else:
+                            # Try base name matching (before " - " or similar)
+                            base_name = customer_name.split(" - ")[0].split(" – ")[0].split("-")[0].strip()
+                            base_normalized = re.sub(r"[^a-z0-9]", "", base_name.lower())
+                            if base_normalized in name_to_accountid_unmapped:
+                                account_id = name_to_accountid_unmapped[base_normalized]
+                                
+                                # Only set if customer doesn't already have AccountID in customer file
+                                if customer_id not in customers_with_accountid_in_file:
+                                    found_count += 1
+                                    
+                                    # Set the AccountID custom field
+                                    if update_customer_custom_field(customer_id, CUSTOMER_NUMBER_FIELD_ID, account_id):
+                                        updated_count += 1
+                                        new_customers_list.append((customer_name, account_id))
+                                
+                                # Remove from unmapped list since we found it (whether we set it or not)
+                                account_ids_without_customer_id.discard(account_id)
+                    
+                    # Check if there are more pages
+                    total_items = payload.get("totalItems", 0)
+                    current_page = payload.get("currentPage", page)
+                    if (current_page + 1) * limit >= total_items:
+                        break
+                    
+                    page += 1
+                    total_processed += len(customers)
+                    
+                    # Show progress every 10 pages
+                    if page % 10 == 0:
+                        st.write(f"   ⏳ Processed {total_processed:,} customers, found {found_count} matches, {len(account_ids_without_customer_id)} remaining...")
+                    
+                    # Stop early if we found all AccountIDs
+                    if not account_ids_without_customer_id:
+                        break
+                
+                if found_count > 0:
+                    st.write(f"✅ Found {found_count} customers in TABS and set AccountIDs for {updated_count} customers")
+                    if new_customers_list:
+                        st.write(f"   Customers: {', '.join([f'{name} (AccountID: {acct})' for name, acct in new_customers_list])}")
+            except Exception as e:
+                st.write(f"⚠️ Error finding new customers: {str(e)}")
+    
     return income_upload, lbpa_df, combined_csv_bytes, combined_internal_csv_bytes
 
 
@@ -1639,15 +3058,70 @@ tab_names = [
 
 with usage_tab:
     st.subheader("Generate Usage File")
-    income_file = st.file_uploader("Upload Income Transaction Data", type="csv", key="income")
     
-    if income_file is not None:
-        persist_upload(income_file, "income")
+    # Multi-file uploader
+    uploaded_files_list = st.file_uploader("Upload CSV Files", type="csv", accept_multiple_files=True, key="all_files")
     
-    # Show preview directly under Income uploader
+    # Store uploaded files in session state
+    if uploaded_files_list:
+        # Initialize file assignments if not exists
+        if "file_assignments" not in st.session_state:
+            st.session_state["file_assignments"] = {}
+        
+        # Get list of file names
+        file_names = [f.name for f in uploaded_files_list]
+        
+        # File type selectors
+        st.markdown("**Assign file types:**")
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            income_file_name = st.selectbox(
+                "Income File",
+                options=[""] + file_names,
+                key="income_file_selector",
+                help="Select which file contains Income transaction data"
+            )
+        
+        with col2:
+            lbpa_file_name = st.selectbox(
+                "LBPA File",
+                options=[""] + file_names,
+                key="lbpa_file_selector",
+                help="Select which file contains LBPA transaction data"
+            )
+        
+        with col3:
+            customer_file_name = st.selectbox(
+                "Customer File",
+                options=[""] + file_names,
+                key="customer_file_selector",
+                help="Select which file contains customer mapping data (must have 'ID' and 'Customer Number' columns)"
+            )
+        
+        # Store assignments
+        if income_file_name:
+            st.session_state["file_assignments"]["income"] = income_file_name
+        if lbpa_file_name:
+            st.session_state["file_assignments"]["lbpa"] = lbpa_file_name
+        if customer_file_name:
+            st.session_state["file_assignments"]["customer"] = customer_file_name
+        
+        # Find and persist the selected files
+        for uploaded_file in uploaded_files_list:
+            if income_file_name and uploaded_file.name == income_file_name:
+                persist_upload(uploaded_file, "income")
+            if lbpa_file_name and uploaded_file.name == lbpa_file_name:
+                persist_upload(uploaded_file, "lbpa")
+            if customer_file_name and uploaded_file.name == customer_file_name:
+                persist_upload(uploaded_file, "customer")
+    
+    # Show previews
     uploaded_files = st.session_state.get("uploaded_files", {})
+    
     if uploaded_files.get("income", {}).get("bytes"):
-        with st.expander("Preview", expanded=False):
+        st.markdown("**Income File Preview:**")
+        with st.expander("Preview Income File", expanded=False):
             try:
                 income_df = pd.read_csv(BytesIO(uploaded_files["income"]["bytes"]))
                 st.caption(f"Rows: {len(income_df):,} | Columns: {len(income_df.columns)}")
@@ -1655,20 +3129,35 @@ with usage_tab:
             except Exception as e:
                 st.error(f"Could not preview Income file: {e}")
     
-    lbpa_file = st.file_uploader("Upload LBPA Transaction Data", type="csv", key="lbpa")
-    
-    if lbpa_file is not None:
-        persist_upload(lbpa_file, "lbpa")
-    
-    # Show preview directly under LBPA uploader
     if uploaded_files.get("lbpa", {}).get("bytes"):
-        with st.expander("Preview", expanded=False):
+        st.markdown("**LBPA File Preview:**")
+        with st.expander("Preview LBPA File", expanded=False):
             try:
                 lbpa_df = pd.read_csv(BytesIO(uploaded_files["lbpa"]["bytes"]))
                 st.caption(f"Rows: {len(lbpa_df):,} | Columns: {len(lbpa_df.columns)}")
                 st.dataframe(lbpa_df, use_container_width=True)
             except Exception as e:
                 st.error(f"Could not preview LBPA file: {e}")
+    
+    if uploaded_files.get("customer", {}).get("bytes"):
+        st.markdown("**Customer File Preview:**")
+        with st.expander("Preview Customer File", expanded=False):
+            try:
+                customer_df = pd.read_csv(BytesIO(uploaded_files["customer"]["bytes"]))
+                st.caption(f"Rows: {len(customer_df):,} | Columns: {len(customer_df.columns)}")
+                st.dataframe(customer_df, use_container_width=True)
+                
+                # Check if required columns exist
+                required_cols = ["ID", "Customer Number"]
+                missing_cols = [col for col in required_cols if col not in customer_df.columns]
+                if missing_cols:
+                    st.warning(f"⚠️ Missing required columns: {', '.join(missing_cols)}")
+                else:
+                    # Show mapping stats
+                    valid_mappings = customer_df[["ID", "Customer Number"]].dropna()
+                    valid_mappings = valid_mappings[valid_mappings["Customer Number"].astype(str).str.strip() != ""]
+            except Exception as e:
+                st.error(f"Could not preview Customer file: {e}")
 
     # Client mappings are automatically loaded from disk at startup
     current_mappings = st.session_state.get("client_mappings", {})
@@ -1679,9 +3168,33 @@ with usage_tab:
             st.session_state["client_mappings"] = disk_mappings
             current_mappings = disk_mappings
 
-    resolve_now = st.checkbox("Retrieve Tabs Customer IDs (requires API key)")
-    if resolve_now:
-        st.text_input("Tabs API Key", type="password", key="ui_api_key_usage", placeholder="Enter Tabs API key")
+    # Split invoice configuration
+    st.markdown("---")
+    enable_split_invoices = st.checkbox("Enable Split Invoices")
+    
+    split_customers = []
+    if enable_split_invoices:
+        # Get unique customer names from the customer file for selection
+        if uploaded_files.get("customer", {}).get("bytes"):
+            try:
+                customer_df = pd.read_csv(BytesIO(uploaded_files["customer"]["bytes"]))
+                name_col = "Name" if "Name" in customer_df.columns else None
+                if name_col:
+                    unique_customer_names = customer_df[name_col].dropna().unique()
+                    unique_customer_names = [str(name).strip() for name in unique_customer_names if str(name).strip() and str(name).lower() != 'nan']
+                    
+                    if len(unique_customer_names) > 0:
+                        split_customers = st.multiselect(
+                            "Select customers for split invoices",
+                            options=unique_customer_names,
+                            help="Select which customers should have split invoice numbering applied"
+                        )
+                    else:
+                        st.warning("No valid customer names found in customer file")
+                else:
+                    st.warning("Customer Name column not found in customer file")
+            except Exception as e:
+                st.warning(f"Could not load customer names for selection: {e}")
 
     # Usage date picker
     st.markdown("---")
@@ -1698,6 +3211,8 @@ with usage_tab:
             missing.append("Income")
         if not up.get("lbpa", {}).get("bytes"):
             missing.append("LBPA")
+        if not up.get("customer", {}).get("bytes"):
+            missing.append("Customer File")
 
         if not missing:
             if not usage_date:
@@ -1706,15 +3221,19 @@ with usage_tab:
                 with st.spinner("Running transformation..."):
                     # Use stored mappings if available
                     stored_mappings = st.session_state.get("client_mappings")
+                    # Get customer file (required)
+                    uploaded_customer = BytesIO(up["customer"]["bytes"])
+                    
                     income_df, lbpa_df, combined_csv, combined_internal_csv = transform_usage(
                         BytesIO(up["income"]["bytes"]),
                         BytesIO(up["lbpa"]["bytes"]),
+                        uploaded_customer,
                         uploaded_clients=None,
-                        resolve_now=resolve_now,
+                        resolve_now=True,  # Always enabled - AccountIDs will be set if API key is provided
                         usage_date=usage_date,
                         mappings=stored_mappings if stored_mappings else None,
+                        split_customers=split_customers if enable_split_invoices else [],
                     )
-                st.success("Transformation complete!")
                 st.session_state["show_usage_download"] = True
         else:
             st.error(f"Missing: {', '.join(missing)}")
@@ -1804,54 +3323,673 @@ with chunk_tab:
         
         st.info("This step creates one CSV file per customer from the original Income and LBPA data uploaded in the 'Usage Transformation' tab. Each CSV contains all original columns and is grouped by customer ID.")
         
-        # Check if original data is available
-        has_original_data = (
-            st.session_state.get("original_income_df") is not None and
-            st.session_state.get("original_lbpa_df") is not None
-        )
-        
-        if not has_original_data:
+        # Check if Usage CSV was generated first
+        if not st.session_state.get("show_usage_download"):
             st.warning("⚠️ Please generate Usage CSV in the 'Usage Transformation' tab first. This will ensure the original Income and LBPA data is available for creating split CSVs with all columns.")
-        
-        # Generate split CSVs
-        if has_original_data:
-            if st.button("Generate Split CSVs", type="primary"):
-                try:
-                    with st.spinner("Creating split CSVs..."):
-                        # Get original Income and LBPA dataframes from session state
-                        income_df = st.session_state.get("original_income_df")
-                        lbpa_df = st.session_state.get("original_lbpa_df")
-                        
-                        # Get Usage CSV (which has customer_id) - use generated or uploaded
-                        usage_df = st.session_state.get("invoice_usage_csv")
-                        if usage_df is None and st.session_state.get("generated_files", {}).get("usage_combined"):
-                            usage_csv_bytes = st.session_state["generated_files"]["usage_combined"]["bytes"]
-                            usage_df = pd.read_csv(BytesIO(usage_csv_bytes))
-                        
-                        if usage_df is None or len(usage_df) == 0:
-                            st.error("⚠️ Usage CSV not found. Please generate Usage CSV in the 'Usage Transformation' tab first.")
-                        elif income_df is None or lbpa_df is None:
-                            st.error("⚠️ Original Income/LBPA data not found. Please generate Usage CSV in the 'Usage Transformation' tab first.")
-                        else:
-                            split_csvs = generate_split_csvs_with_all_columns(
-                                income_df, 
-                                lbpa_df, 
-                                usage_df,
-                                max_rows_per_split_csv=999999  # One CSV per customer, no splitting
-                            )
+        else:
+            # Get the generated files
+            generated_files = st.session_state.get("generated_files", {})
+            
+            if not generated_files.get("usage_combined"):
+                st.warning("⚠️ Usage CSV not found. Please generate Usage CSV in the 'Usage Transformation' tab first.")
+            else:
+                # Get original Income and LBPA data from session state
+                uploaded_files_check = st.session_state.get("uploaded_files", {})
+                
+                if not uploaded_files_check.get("income", {}).get("bytes") or not uploaded_files_check.get("lbpa", {}).get("bytes"):
+                    st.warning("⚠️ Original Income/LBPA data not found. Please generate Usage CSV in the 'Usage Transformation' tab first.")
+                else:
+                    # Read the generated usage CSV to get customer mappings
+                    usage_csv_bytes = generated_files["usage_combined"]["bytes"]
+                    usage_df = pd.read_csv(BytesIO(usage_csv_bytes))
+                    
+                    # Read original Income and LBPA files
+                    income_df = pd.read_csv(BytesIO(uploaded_files_check["income"]["bytes"]))
+                    lbpa_df = pd.read_csv(BytesIO(uploaded_files_check["lbpa"]["bytes"]))
+                    
+                    if st.button("Generate Split CSVs", type="primary"):
+                        with st.spinner("Generating split CSVs..."):
+                            split_csvs = generate_split_csvs_with_all_columns(income_df, lbpa_df, usage_df)
                             
-                            if len(split_csvs) == 0:
-                                st.warning(f"⚠️ No split CSVs created. Check that customer_id mapping is working correctly.")
-                            else:
+                            if split_csvs:
                                 st.session_state["invoice_split_csvs"] = split_csvs
-                                st.session_state["invoice_split_csvs_ready"] = True
-                                st.success(f"✅ Created {len(split_csvs)} split CSV files with all original columns")
-                except Exception as e:
-                    st.error(f"Error creating split CSVs: {str(e)}")
-                    import traceback
-                    st.code(traceback.format_exc())
+                                st.session_state["split_csvs_ready"] = True
+                                
+                                # Show summary
+                                summary_data = []
+                                for split_csv in split_csvs:
+                                    csv_df = pd.read_csv(BytesIO(split_csv["bytes"]))
+                                    summary_data.append({
+                                        "Filename": split_csv["name"],
+                                        "Rows": len(csv_df),
+                                        "Customer ID": csv_df["customer_id"].iloc[0] if "customer_id" in csv_df.columns and len(csv_df) > 0 else "N/A"
+                                    })
+                                
+                                summary_df = pd.DataFrame(summary_data)
+                                st.success(f"✅ Generated {len(split_csvs)} split CSV files")
+                                st.dataframe(summary_df, use_container_width=True)
+                            else:
+                                st.warning("⚠️ No split CSVs created. Check that customer IDs are properly mapped.")
+    
+    elif current_step == 1:  # Step 2: Invoice Mapping
+        st.subheader("Invoice Mapping")
         
-        # Display download options if split CSVs are ready (outside button handler so they persist)
+        st.info("Map each split CSV to the correct invoice using the Tabs API. Enter your API key and select the invoice issue date.")
+        
+        # Check if split CSVs are ready
+        if not st.session_state.get("split_csvs_ready"):
+            st.warning("⚠️ Please complete Step 1 first (Generate Split CSVs)")
+        else:
+            # API Key input
+            api_key_attach = st.text_input("Tabs API Key", type="password", key="ui_api_key_attach", 
+                                         value=st.session_state.get("invoice_api_key", ""),
+                                         help="Enter your Tabs API key for invoice mapping")
+            
+            if api_key_attach:
+                st.session_state["invoice_api_key"] = api_key_attach
+            
+            # Invoice cache management
+            st.markdown("---")
+            st.subheader("Invoice Cache Management")
+            
+            cache_dir = os.path.join(OUTPUT_DIR, "_session")
+            cache_file = os.path.join(cache_dir, "invoice_cache_tabs_sk_mA.json")
+            
+            cache_exists = os.path.exists(cache_file)
+            cache_age = None
+            cache_count = 0
+            
+            if cache_exists:
+                try:
+                    cache_mtime = os.path.getmtime(cache_file)
+                    cache_age = datetime.now().timestamp() - cache_mtime
+                    cache_age_hours = cache_age / 3600
+                    
+                    # Load cache to get count
+                    with open(cache_file, 'r') as f:
+                        cache_data = json.load(f)
+                        cache_count = len(cache_data) if isinstance(cache_data, list) else 0
+                    
+                    if cache_age_hours < 6:
+                        cache_status = "✅ Fresh"
+                    elif cache_age_hours < 24:
+                        cache_status = "ℹ️ Moderate"
+                    else:
+                        cache_status = "⚠️ Old"
+                    
+                    st.info(f"{cache_status}: {cache_count} invoices cached ({cache_age_hours:.1f} hours old)")
+                except Exception:
+                    pass
+            
+            if st.button("🔄 Refresh Cache", help="Fetch all invoices from the API (may take a few minutes)"):
+                if not api_key_attach:
+                    st.error("⚠️ Please enter API key first")
+                else:
+                    with st.spinner("Fetching all invoices from API..."):
+                        fetch_all_invoices_for_cache(api_key_attach)
+                        st.success("✅ Cache refreshed!")
+                        st.rerun()
+            
+            st.markdown("---")
+            
+            # Invoice issue date selector
+            issue_date = st.date_input(
+                "Select Invoice Issue Date",
+                value=datetime.now().date(),
+                help="Select the issue date for the invoices you want to map to"
+            )
+            
+            if st.button("Map Invoices to Split CSVs", type="primary"):
+                if not api_key_attach:
+                    st.error("⚠️ Please enter API key first")
+                else:
+                    split_csvs = st.session_state.get("invoice_split_csvs", [])
+                    if not split_csvs:
+                        st.error("⚠️ No split CSVs found. Please complete Step 1 first.")
+                    else:
+                        with st.spinner("Mapping invoices..."):
+                            mapping_results = []
+                            
+                            for split_csv in split_csvs:
+                                csv_df = pd.read_csv(BytesIO(split_csv["bytes"]))
+                                customer_id = None
+                                
+                                # Try to get customer_id from the CSV
+                                if "customer_id" in csv_df.columns:
+                                    customer_ids = csv_df["customer_id"].dropna().unique()
+                                    if len(customer_ids) > 0:
+                                        customer_id = str(customer_ids[0]).strip()
+                                
+                                if not customer_id or customer_id == "nan":
+                                    mapping_results.append({
+                                        "split_csv_filename": split_csv["name"],
+                                        "customer_id": "N/A",
+                                        "invoice_id": "Not Found",
+                                        "status": "Failed",
+                                        "reason": "No customer ID in CSV"
+                                    })
+                                    continue
+                                
+                                # Look up invoice for this customer
+                                invoice_id = find_invoice_for_customer(customer_id, issue_date, api_key_attach)
+                                
+                                if invoice_id:
+                                    mapping_results.append({
+                                        "split_csv_filename": split_csv["name"],
+                                        "customer_id": customer_id,
+                                        "invoice_id": invoice_id,
+                                        "status": "Success"
+                                    })
+                                else:
+                                    mapping_results.append({
+                                        "split_csv_filename": split_csv["name"],
+                                        "customer_id": customer_id,
+                                        "invoice_id": "Not Found",
+                                        "status": "Failed",
+                                        "reason": "No matching invoice found"
+                                    })
+                            
+                            mapping_df = pd.DataFrame(mapping_results)
+                            st.session_state["invoice_mapping"] = mapping_df
+                            st.session_state["invoice_mapping_ready"] = True
+                            
+                            # Show results
+                            success_count = (mapping_df["status"] == "Success").sum()
+                            st.success(f"✅ Mapped {success_count}/{len(mapping_df)} split CSVs to invoices")
+                            
+                            # Show successful mappings
+                            successful_mappings = mapping_df[mapping_df["status"] == "Success"]
+                            if len(successful_mappings) > 0:
+                                st.dataframe(successful_mappings[["split_csv_filename", "customer_id", "invoice_id"]], use_container_width=True)
+                            
+                            # Show unmapped files
+                            unmapped = mapping_df[mapping_df["status"] == "Failed"]
+                            if len(unmapped) > 0:
+                                st.warning(f"⚠️ {len(unmapped)} Split CSVs Requiring Attention")
+                                st.dataframe(unmapped, use_container_width=True)
+                            
+                            # Download mapping CSV
+                            if len(mapping_df) > 0:
+                                mapping_csv_bytes = mapping_df.to_csv(index=False).encode("utf-8")
+                                st.download_button(
+                                    "Download Invoice Mapping CSV",
+                                    data=mapping_csv_bytes,
+                                    file_name=f"invoice_mapping_{datetime.now().strftime('%Y%m%d')}.csv",
+                                    key="dl_invoice_mapping"
+                                )
+    
+    elif current_step == 2:  # Step 3: Bulk Upload
+        st.subheader("Bulk Upload CSV Attachments")
+        
+        st.info("Upload all mapped CSV files as attachments to their corresponding invoices.")
+        
+        # Check if mapping is ready
+        mapping_ready = False
+        mapping_df = None
+        
+        # Option to upload mapping CSV
+        uploaded_mapping = st.file_uploader("Upload Invoice Mapping CSV (optional)", type=["csv"], key="upload_mapping_csv")
+        
+        if uploaded_mapping:
+            try:
+                mapping_df = pd.read_csv(uploaded_mapping)
+                required_cols = ["split_csv_filename", "customer_id", "invoice_id"]
+                if all(col in mapping_df.columns for col in required_cols):
+                    mapping_ready = True
+                    st.success(f"✅ Loaded {len(mapping_df)} mappings from CSV")
+                    st.dataframe(mapping_df, use_container_width=True)
+                else:
+                    st.error(f"CSV must have columns: {', '.join(required_cols)}")
+            except Exception as e:
+                st.error(f"Error reading CSV: {str(e)}")
+        else:
+            # Use generated mapping from Step 2
+            if not st.session_state.get("invoice_mapping_ready"):
+                st.warning("⚠️ Please complete Step 2 first (Invoice Mapping) or upload a CSV mapping file")
+            else:
+                mapping_df = st.session_state.get("invoice_mapping")
+                mapping_ready = True
+        
+        if mapping_ready and mapping_df is not None:
+            split_csvs = st.session_state.get("invoice_split_csvs", [])
+            
+            if not split_csvs:
+                st.warning("⚠️ Split CSVs not found. Please complete Step 1 first (Generate Split CSVs)")
+            else:
+                st.info(f"📋 Ready to upload {len(mapping_df)} split CSVs to invoices")
+                
+                # Create lookup dict for split CSVs
+                split_csvs_dict = {split_csv["name"]: split_csv for split_csv in split_csvs}
+            
+                # Show preview
+                st.subheader("Upload Preview")
+                preview_df = mapping_df.copy()
+                preview_df["split_csv_size"] = preview_df["split_csv_filename"].map(
+                    lambda x: len(pd.read_csv(BytesIO(split_csvs_dict[x]["bytes"]))) if x in split_csvs_dict else 0
+                )
+                preview_df["split_csv_exists"] = preview_df["split_csv_filename"].map(
+                    lambda x: "Yes" if x in split_csvs_dict else "No"
+                )
+                st.dataframe(preview_df, use_container_width=True)
+                
+                # Check for missing split CSVs
+                missing_csvs = preview_df[preview_df["split_csv_exists"] == "No"]["split_csv_filename"].tolist()
+                if missing_csvs:
+                    st.warning(f"⚠️ {len(missing_csvs)} split CSV(s) not found: {', '.join(missing_csvs[:5])}{'...' if len(missing_csvs) > 5 else ''}")
+                
+                api_key = st.session_state.get('invoice_api_key', '')
+                
+                if not api_key:
+                    st.warning("⚠️ Please enter API key in Step 2")
+                else:
+                    # Add test mode option
+                    test_mode = st.checkbox("🧪 Test Mode: Upload only one row from the first split CSV", value=False)
+                    
+                    if st.button("Start Bulk Upload", type="primary"):
+                        try:
+                            with st.spinner("Uploading CSV attachments..."):
+                                upload_results = []
+                                progress_bar = st.progress(0)
+                                
+                                # Limit to first row if test mode is enabled
+                                rows_to_process = mapping_df.head(1) if test_mode else mapping_df
+                                
+                                for idx, row in rows_to_process.iterrows():
+                                    split_csv_name = row["split_csv_filename"]
+                                    customer_id = row["customer_id"]
+                                    invoice_id = row["invoice_id"]
+                                    
+                                    if split_csv_name not in split_csvs_dict:
+                                        upload_results.append({
+                                            "split_csv": split_csv_name,
+                                            "status": "Failed",
+                                            "reason": "Split CSV not found"
+                                        })
+                                        continue
+                                    
+                                    split_csv_bytes = split_csvs_dict[split_csv_name]["bytes"]
+                                    
+                                    # In test mode, create a CSV with only the first row
+                                    if test_mode:
+                                        try:
+                                            test_df = pd.read_csv(BytesIO(split_csv_bytes))
+                                            if len(test_df) > 0:
+                                                # Keep only the first row
+                                                test_df = test_df.head(1)
+                                                # Create new filename with "_test" suffix
+                                                test_filename = split_csv_name.replace(".csv", "_test.csv")
+                                                split_csv_bytes = test_df.to_csv(index=False).encode("utf-8")
+                                                split_csv_name = test_filename
+                                            else:
+                                                upload_results.append({
+                                                    "split_csv": split_csv_name,
+                                                    "status": "Failed",
+                                                    "reason": "CSV is empty"
+                                                })
+                                                continue
+                                        except Exception as e:
+                                            upload_results.append({
+                                                "split_csv": split_csv_name,
+                                                "status": "Failed",
+                                                "reason": f"Error reading CSV: {str(e)}"
+                                            })
+                                            continue
+                                    
+                                    # Upload CSV as attachment to invoice
+                                    success = upload_csv_attachment(
+                                        customer_id,
+                                        invoice_id,
+                                        split_csv_bytes,
+                                        split_csv_name,
+                                        api_key
+                                    )
+                                    
+                                    upload_results.append({
+                                        "split_csv": split_csv_name,
+                                        "customer_id": customer_id,
+                                        "invoice_id": invoice_id,
+                                        "status": "Success" if success else "Failed",
+                                        "reason": "" if success else "Upload failed"
+                                    })
+                                    
+                                    progress_bar.progress((idx + 1) / len(rows_to_process))
+                                
+                                results_df = pd.DataFrame(upload_results)
+                                st.session_state["upload_results"] = results_df
+                                
+                                success_count = (results_df["status"] == "Success").sum()
+                                progress_bar.empty()
+                                
+                                if test_mode:
+                                    st.success(f"✅ Test upload complete! {success_count}/{len(results_df)} successful")
+                                else:
+                                    st.success(f"✅ Upload complete! {success_count}/{len(results_df)} successful")
+                                
+                        except Exception as e:
+                            st.error(f"Error during bulk upload: {str(e)}")
+                            import traceback
+                            st.code(traceback.format_exc())
+                        with st.spinner("Generating split CSVs..."):
+                            split_csvs = generate_split_csvs_with_all_columns(income_df, lbpa_df, usage_df)
+                            
+                            if split_csvs:
+                                st.session_state["invoice_split_csvs"] = split_csvs
+                                st.session_state["split_csvs_ready"] = True
+                                
+                                # Show summary
+                                summary_data = []
+                                for split_csv in split_csvs:
+                                    csv_df = pd.read_csv(BytesIO(split_csv["bytes"]))
+                                    summary_data.append({
+                                        "Filename": split_csv["name"],
+                                        "Rows": len(csv_df),
+                                        "Customer ID": csv_df["customer_id"].iloc[0] if "customer_id" in csv_df.columns and len(csv_df) > 0 else "N/A"
+                                    })
+                                
+                                summary_df = pd.DataFrame(summary_data)
+                                st.success(f"✅ Generated {len(split_csvs)} split CSV files")
+                                st.dataframe(summary_df, use_container_width=True)
+                            else:
+                                st.warning("⚠️ No split CSVs created. Check that customer IDs are properly mapped.")
+    
+    elif current_step == 1:  # Step 2: Invoice Mapping
+        st.subheader("Invoice Mapping")
+        
+        st.info("Map each split CSV to the correct invoice using the Tabs API. Enter your API key and select the invoice issue date.")
+        
+        # Check if split CSVs are ready
+        if not st.session_state.get("split_csvs_ready"):
+            st.warning("⚠️ Please complete Step 1 first (Generate Split CSVs)")
+        else:
+            # API Key input
+            api_key_attach = st.text_input("Tabs API Key", type="password", key="ui_api_key_attach", 
+                                         value=st.session_state.get("invoice_api_key", ""),
+                                         help="Enter your Tabs API key for invoice mapping")
+            
+            if api_key_attach:
+                st.session_state["invoice_api_key"] = api_key_attach
+            
+            # Invoice cache management
+            st.markdown("---")
+            st.subheader("Invoice Cache Management")
+            
+            cache_dir = os.path.join(OUTPUT_DIR, "_session")
+            cache_file = os.path.join(cache_dir, "invoice_cache_tabs_sk_mA.json")
+            
+            cache_exists = os.path.exists(cache_file)
+            cache_age = None
+            cache_count = 0
+            
+            if cache_exists:
+                try:
+                    cache_mtime = os.path.getmtime(cache_file)
+                    cache_age = datetime.now().timestamp() - cache_mtime
+                    cache_age_hours = cache_age / 3600
+                    
+                    # Load cache to get count
+                    with open(cache_file, 'r') as f:
+                        cache_data = json.load(f)
+                        cache_count = len(cache_data) if isinstance(cache_data, list) else 0
+                    
+                    if cache_age_hours < 6:
+                        cache_status = "✅ Fresh"
+                    elif cache_age_hours < 24:
+                        cache_status = "ℹ️ Moderate"
+                    else:
+                        cache_status = "⚠️ Old"
+                    
+                    st.info(f"{cache_status}: {cache_count} invoices cached ({cache_age_hours:.1f} hours old)")
+                except Exception:
+                    pass
+            
+            if st.button("🔄 Refresh Cache", help="Fetch all invoices from the API (may take a few minutes)"):
+                if not api_key_attach:
+                    st.error("⚠️ Please enter API key first")
+                else:
+                    with st.spinner("Fetching all invoices from API..."):
+                        fetch_all_invoices_for_cache(api_key_attach)
+                        st.success("✅ Cache refreshed!")
+                        st.rerun()
+            
+            st.markdown("---")
+            
+            # Invoice issue date selector
+            issue_date = st.date_input(
+                "Select Invoice Issue Date",
+                value=datetime.now().date(),
+                help="Select the issue date for the invoices you want to map to"
+            )
+            
+            if st.button("Map Invoices to Split CSVs", type="primary"):
+                if not api_key_attach:
+                    st.error("⚠️ Please enter API key first")
+                else:
+                    split_csvs = st.session_state.get("invoice_split_csvs", [])
+                    if not split_csvs:
+                        st.error("⚠️ No split CSVs found. Please complete Step 1 first.")
+                    else:
+                        with st.spinner("Mapping invoices..."):
+                            mapping_results = []
+                            
+                            for split_csv in split_csvs:
+                                csv_df = pd.read_csv(BytesIO(split_csv["bytes"]))
+                                customer_id = None
+                                
+                                # Try to get customer_id from the CSV
+                                if "customer_id" in csv_df.columns:
+                                    customer_ids = csv_df["customer_id"].dropna().unique()
+                                    if len(customer_ids) > 0:
+                                        customer_id = str(customer_ids[0]).strip()
+                                
+                                if not customer_id or customer_id == "nan":
+                                    mapping_results.append({
+                                        "split_csv_filename": split_csv["name"],
+                                        "customer_id": "N/A",
+                                        "invoice_id": "Not Found",
+                                        "status": "Failed",
+                                        "reason": "No customer ID in CSV"
+                                    })
+                                    continue
+                                
+                                # Look up invoice for this customer
+                                invoice_id = find_invoice_for_customer(customer_id, issue_date, api_key_attach)
+                                
+                                if invoice_id:
+                                    mapping_results.append({
+                                        "split_csv_filename": split_csv["name"],
+                                        "customer_id": customer_id,
+                                        "invoice_id": invoice_id,
+                                        "status": "Success"
+                                    })
+                                else:
+                                    mapping_results.append({
+                                        "split_csv_filename": split_csv["name"],
+                                        "customer_id": customer_id,
+                                        "invoice_id": "Not Found",
+                                        "status": "Failed",
+                                        "reason": "No matching invoice found"
+                                    })
+                            
+                            mapping_df = pd.DataFrame(mapping_results)
+                            st.session_state["invoice_mapping"] = mapping_df
+                            st.session_state["invoice_mapping_ready"] = True
+                            
+                            # Show results
+                            success_count = (mapping_df["status"] == "Success").sum()
+                            st.success(f"✅ Mapped {success_count}/{len(mapping_df)} split CSVs to invoices")
+                            
+                            # Show successful mappings
+                            successful_mappings = mapping_df[mapping_df["status"] == "Success"]
+                            if len(successful_mappings) > 0:
+                                st.dataframe(successful_mappings[["split_csv_filename", "customer_id", "invoice_id"]], use_container_width=True)
+                            
+                            # Show unmapped files
+                            unmapped = mapping_df[mapping_df["status"] == "Failed"]
+                            if len(unmapped) > 0:
+                                st.warning(f"⚠️ {len(unmapped)} Split CSVs Requiring Attention")
+                                st.dataframe(unmapped, use_container_width=True)
+                            
+                            # Download mapping CSV
+                            if len(mapping_df) > 0:
+                                mapping_csv_bytes = mapping_df.to_csv(index=False).encode("utf-8")
+                                st.download_button(
+                                    "Download Invoice Mapping CSV",
+                                    data=mapping_csv_bytes,
+                                    file_name=f"invoice_mapping_{datetime.now().strftime('%Y%m%d')}.csv",
+                                    key="dl_invoice_mapping"
+                                )
+    
+    elif current_step == 2:  # Step 3: Bulk Upload
+        st.subheader("Bulk Upload CSV Attachments")
+        
+        st.info("Upload all mapped CSV files as attachments to their corresponding invoices.")
+        
+        # Check if mapping is ready
+        mapping_ready = False
+        mapping_df = None
+        
+        # Option to upload mapping CSV
+        uploaded_mapping = st.file_uploader("Upload Invoice Mapping CSV (optional)", type=["csv"], key="upload_mapping_csv")
+        
+        if uploaded_mapping:
+            try:
+                mapping_df = pd.read_csv(uploaded_mapping)
+                required_cols = ["split_csv_filename", "customer_id", "invoice_id"]
+                if all(col in mapping_df.columns for col in required_cols):
+                    mapping_ready = True
+                    st.success(f"✅ Loaded {len(mapping_df)} mappings from CSV")
+                    st.dataframe(mapping_df, use_container_width=True)
+                else:
+                    st.error(f"CSV must have columns: {', '.join(required_cols)}")
+            except Exception as e:
+                st.error(f"Error reading CSV: {str(e)}")
+        else:
+            # Use generated mapping from Step 2
+            if not st.session_state.get("invoice_mapping_ready"):
+                st.warning("⚠️ Please complete Step 2 first (Invoice Mapping) or upload a CSV mapping file")
+            else:
+                mapping_df = st.session_state.get("invoice_mapping")
+                mapping_ready = True
+        
+        if mapping_ready and mapping_df is not None:
+            split_csvs = st.session_state.get("invoice_split_csvs", [])
+            
+            if not split_csvs:
+                st.warning("⚠️ Split CSVs not found. Please complete Step 1 first (Generate Split CSVs)")
+            else:
+                st.info(f"📋 Ready to upload {len(mapping_df)} split CSVs to invoices")
+                
+                # Create lookup dict for split CSVs
+                split_csvs_dict = {split_csv["name"]: split_csv for split_csv in split_csvs}
+            
+                # Show preview
+                st.subheader("Upload Preview")
+                preview_df = mapping_df.copy()
+                preview_df["split_csv_size"] = preview_df["split_csv_filename"].map(
+                    lambda x: len(pd.read_csv(BytesIO(split_csvs_dict[x]["bytes"]))) if x in split_csvs_dict else 0
+                )
+                preview_df["split_csv_exists"] = preview_df["split_csv_filename"].map(
+                    lambda x: "Yes" if x in split_csvs_dict else "No"
+                )
+                st.dataframe(preview_df, use_container_width=True)
+                
+                # Check for missing split CSVs
+                missing_csvs = preview_df[preview_df["split_csv_exists"] == "No"]["split_csv_filename"].tolist()
+                if missing_csvs:
+                    st.warning(f"⚠️ {len(missing_csvs)} split CSV(s) not found: {', '.join(missing_csvs[:5])}{'...' if len(missing_csvs) > 5 else ''}")
+                
+                api_key = st.session_state.get('invoice_api_key', '')
+                
+                if not api_key:
+                    st.warning("⚠️ Please enter API key in Step 2")
+                else:
+                    # Add test mode option
+                    test_mode = st.checkbox("🧪 Test Mode: Upload only one row from the first split CSV", value=False)
+                    
+                    if st.button("Start Bulk Upload", type="primary"):
+                        try:
+                            with st.spinner("Uploading CSV attachments..."):
+                                upload_results = []
+                                progress_bar = st.progress(0)
+                                
+                                # Limit to first row if test mode is enabled
+                                rows_to_process = mapping_df.head(1) if test_mode else mapping_df
+                                
+                                for idx, row in rows_to_process.iterrows():
+                                    split_csv_name = row["split_csv_filename"]
+                                    customer_id = row["customer_id"]
+                                    invoice_id = row["invoice_id"]
+                                    
+                                    if split_csv_name not in split_csvs_dict:
+                                        upload_results.append({
+                                            "split_csv": split_csv_name,
+                                            "status": "Failed",
+                                            "reason": "Split CSV not found"
+                                        })
+                                        continue
+                                    
+                                    split_csv_bytes = split_csvs_dict[split_csv_name]["bytes"]
+                                    
+                                    # In test mode, create a CSV with only the first row
+                                    if test_mode:
+                                        try:
+                                            test_df = pd.read_csv(BytesIO(split_csv_bytes))
+                                            if len(test_df) > 0:
+                                                # Keep only the first row
+                                                test_df = test_df.head(1)
+                                                # Create new filename with "_test" suffix
+                                                test_filename = split_csv_name.replace(".csv", "_test.csv")
+                                                split_csv_bytes = test_df.to_csv(index=False).encode("utf-8")
+                                                split_csv_name = test_filename
+                                            else:
+                                                upload_results.append({
+                                                    "split_csv": split_csv_name,
+                                                    "status": "Failed",
+                                                    "reason": "CSV is empty"
+                                                })
+                                                continue
+                                        except Exception as e:
+                                            upload_results.append({
+                                                "split_csv": split_csv_name,
+                                                "status": "Failed",
+                                                "reason": f"Error reading CSV: {str(e)}"
+                                            })
+                                            continue
+                                    
+                                    # Upload CSV as attachment to invoice
+                                    success = upload_csv_attachment(
+                                        customer_id,
+                                        invoice_id,
+                                        split_csv_bytes,
+                                        split_csv_name,
+                                        api_key
+                                    )
+                                    
+                                    upload_results.append({
+                                        "split_csv": split_csv_name,
+                                        "customer_id": customer_id,
+                                        "invoice_id": invoice_id,
+                                        "status": "Success" if success else "Failed",
+                                        "reason": "" if success else "Upload failed"
+                                    })
+                                    
+                                    progress_bar.progress((idx + 1) / len(rows_to_process))
+                                
+                                results_df = pd.DataFrame(upload_results)
+                                st.session_state["upload_results"] = results_df
+                                
+                                success_count = (results_df["status"] == "Success").sum()
+                                progress_bar.empty()
+                                
+                                if test_mode:
+                                    st.success(f"✅ Test upload complete! {success_count}/{len(results_df)} successful")
+                                else:
+                                    st.success(f"✅ Upload complete! {success_count}/{len(results_df)} successful")
+                                
+                        except Exception as e:
+                            st.error(f"Error during bulk upload: {str(e)}")
+                            import traceback
+                            st.code(traceback.format_exc())
         if st.session_state.get("invoice_split_csvs_ready"):
             split_csvs = st.session_state.get("invoice_split_csvs", [])
             if split_csvs:

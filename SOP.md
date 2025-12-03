@@ -35,14 +35,6 @@ The tool has two main tabs:
    - Select your LBPA CSV file
    - You'll see a preview showing the number of rows and columns
 
-3. **Customer Mapping CSV** (Auto-loaded)
-   - The customer mapping file is automatically loaded from the session directory
-   - If you see "✅ Customer Mapping CSV loaded from session directory", the file is ready
-   - If you need to upload a different mapping file, it will appear as an uploader
-   - Your mapping file should contain:
-     - Account numbers (Acct# column)
-     - Customer names
-     - Tabs customer IDs (optional, but recommended)
 
 ### Step 2: Map NetSuite IDs (Optional)
 

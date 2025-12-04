@@ -229,13 +229,14 @@ def fetch_customer_events_from_api(customer_id, api_token=None, limit=1000):
     except Exception as e:
         return None
 
-def fetch_obligations_from_api(api_token=None, limit=1000, customer_id=None):
+def fetch_obligations_from_api(api_token=None, limit=1000, customer_id=None, page=None):
     """Fetch obligations from /v3/obligations API
     
     Args:
         api_token: API token for authentication
-        limit: Maximum number of results
+        limit: Maximum number of results per page
         customer_id: Optional customer ID to filter by (uses filter parameter)
+        page: Optional page number for pagination
     """
     if not api_token:
         api_token = API_KEY
@@ -253,8 +254,12 @@ def fetch_obligations_from_api(api_token=None, limit=1000, customer_id=None):
         if customer_id:
             # Use filter parameter to get obligations for specific customer
             url = f'{api_base_url}/obligations?filter=customerId:eq:"{customer_id}"&limit={limit}'
+            if page:
+                url += f"&page={page}"
         else:
             url = f"{api_base_url}/obligations?limit={limit}"
+            if page:
+                url += f"&page={page}"
         
         response = requests.get(url, headers=headers, timeout=30)
         
@@ -299,11 +304,12 @@ def fetch_contracts_from_api(api_token=None, limit=1000):
 def build_customer_event_type_mapping(customer_ids, api_token=None, use_obligations=False):
     """Build mapping from customerId -> list of eventTypeNames using APIs
     
-    Uses /v3/obligations?filter=customerId:eq:"{customer_id}" to get eventTypeIds for each customer
+    Optimized: Fetches ALL obligations once, then groups by customer_id
+    Uses /v3/obligations to get all obligations (with pagination)
     Uses /v3/events/types to map eventTypeId -> eventTypeName
     
     Args:
-        customer_ids: List of customer IDs to map
+        customer_ids: List of customer IDs to map (used to filter results)
         api_token: API token for authentication
         use_obligations: Ignored - always uses /v3/obligations + /v3/events/types
     """
@@ -313,45 +319,106 @@ def build_customer_event_type_mapping(customer_ids, api_token=None, use_obligati
         return {}
     
     # Step 1: Fetch all event types ONCE (eventTypeId -> eventTypeName) from /v3/events/types
-    # This is a one-time call that gives us the mapping for all event type IDs
     event_type_mapping = fetch_event_types_from_api(api_token)
     if not event_type_mapping:
         return {}
     
-    # Step 2: For each customer, fetch their obligations directly using filter parameter
-    # Then map the eventTypeIds from obligations to eventTypeNames using the mapping from step 1
-    customer_to_event_types = {}
+    # Step 1.5: Fetch contracts to map contractId -> customerId (obligations have contractId, not customerId)
+    contract_to_customer = fetch_contracts_from_api(api_token)
+    if not contract_to_customer:
+        contract_to_customer = {}
+    
+    # Step 2: Fetch ALL obligations once (with pagination if needed)
+    # This is much more efficient than calling the API for each customer
+    all_obligations = []
+    page = 1
+    limit = 1000
+    
     progress_bar = st.progress(0)
     status_text = st.empty()
-    total_customers = len(customer_ids)
     
-    for idx, customer_id in enumerate(customer_ids):
-        if idx % 10 == 0:
-            progress_bar.progress((idx + 1) / total_customers)
-            status_text.text(f"Fetching obligations for customer {idx + 1}/{total_customers}...")
-        
-        # Fetch obligations for this specific customer using filter: /v3/obligations?filter=customerId:eq:"{customer_id}"
-        obligations = fetch_obligations_from_api(api_token, customer_id=customer_id)
-        
-        if obligations:
-            event_type_names = []
-            event_type_ids_found = []
-            for obligation in obligations:
-                billing_schedule = obligation.get("billingSchedule", {})
-                event_type_id = billing_schedule.get("eventTypeId")
-                if event_type_id:
-                    event_type_ids_found.append(event_type_id)
-                    if event_type_id in event_type_mapping:
-                        # Map eventTypeId to eventTypeName using the mapping from /v3/events/types (already fetched)
-                        event_type_name = event_type_mapping[event_type_id]
-                        if event_type_name not in event_type_names:
-                            event_type_names.append(event_type_name)
+    try:
+        while True:
+            status_text.text(f"Fetching obligations page {page}...")
+            obligations = fetch_obligations_from_api(api_token, limit=limit, page=page)
             
-            if event_type_names:
-                customer_to_event_types[customer_id] = event_type_names
+            if not obligations:
+                if page == 1:
+                    # First page returned nothing - might be an error
+                    st.warning("⚠️ No obligations returned from API. Check API key and permissions.")
+                break
+            
+            all_obligations.extend(obligations)
+            
+            # Check if we got fewer than the limit (last page)
+            if len(obligations) < limit:
+                break
+            
+            page += 1
+            
+            # Safety check to prevent infinite loops
+            if page > 100:  # Max 100,000 obligations
+                st.warning("⚠️ Reached maximum page limit (100), stopping pagination")
+                break
+            
+            # Update progress
+            progress_bar.progress(min(page / 50, 1.0))
+    except Exception as e:
+        st.error(f"❌ Error fetching obligations: {str(e)}")
+        progress_bar.empty()
+        status_text.empty()
+        return {}
+    finally:
+        progress_bar.empty()
+        status_text.empty()
     
-    progress_bar.empty()
-    status_text.empty()
+    if not all_obligations:
+        return {}
+    
+    # Step 3: Group obligations by customer_id and extract event types
+    customer_to_event_types = {}
+    customer_ids_set = set(customer_ids) if customer_ids else None
+    
+    for obligation in all_obligations:
+        # Obligations have contractId, not customerId directly
+        # We need to map contractId -> customerId using the contracts we fetched
+        contract_id = obligation.get("contractId") or obligation.get("contract_id") or obligation.get("ContractId")
+        if not contract_id:
+            continue
+        
+        # Map contractId to customerId
+        customer_id = contract_to_customer.get(contract_id)
+        if not customer_id:
+            # Try direct customerId field as fallback (in case some obligations have it)
+            customer_id = obligation.get("customerId") or obligation.get("customer_id") or obligation.get("CustomerId")
+            if not customer_id:
+                continue
+        
+        # If we have a specific list of customer_ids, only process those
+        if customer_ids_set and customer_id not in customer_ids_set:
+            continue
+        
+        billing_schedule = obligation.get("billingSchedule", {})
+        if not billing_schedule:
+            continue
+            
+        event_type_id = billing_schedule.get("eventTypeId")
+        if not event_type_id:
+            continue
+        
+        if event_type_id not in event_type_mapping:
+            continue
+        
+        event_type_name = event_type_mapping[event_type_id]
+        
+        if customer_id not in customer_to_event_types:
+            customer_to_event_types[customer_id] = []
+        
+        if event_type_name not in customer_to_event_types[customer_id]:
+            customer_to_event_types[customer_id].append(event_type_name)
+    
+    if not customer_to_event_types:
+        st.warning("⚠️ No customer event type mappings created from obligations")
     
     return customer_to_event_types
 
@@ -591,70 +658,68 @@ def find_invoice_by_date(customer_id, issue_date, api_token):
         if not cached_invoices:
             try:
                 import json
+                # Ensure cache directory exists
+                os.makedirs(_CACHE_DIR, exist_ok=True)
                 cache_file = os.path.join(_CACHE_DIR, f"invoice_cache_{api_token[:10]}.json")
                 if os.path.exists(cache_file):
                     with open(cache_file, 'r') as f:
                         cache_data = json.load(f)
                         cached_invoices = cache_data.get('invoices', [])
-                        cache_timestamp_str = cache_data.get('timestamp')
                         
-                        # Check TTL (1 hour = 3600 seconds)
-                        if cache_timestamp_str:
-                            try:
-                                if isinstance(cache_timestamp_str, (int, float)):
-                                    cache_time = cache_timestamp_str
-                                else:
-                                    cache_time = datetime.fromisoformat(cache_timestamp_str).timestamp()
-                                
-                                current_time = datetime.now().timestamp()
-                                age_seconds = current_time - cache_time
-                                
-                                if age_seconds < 3600:  # Less than 1 hour old
-                                    # Restore to session state
-                                    st.session_state[cache_key] = cached_invoices
-                                else:
-                                    # Cache expired - still use it but warn user might want to refresh
-                                    st.session_state[cache_key] = cached_invoices
-                            except Exception:
-                                # If timestamp parsing fails, use cache anyway
-                                st.session_state[cache_key] = cached_invoices
-                        else:
-                            # No timestamp, use cache anyway
+                        # Always restore to session state if we loaded from file
+                        if cached_invoices:
                             st.session_state[cache_key] = cached_invoices
-            except Exception:
+            except Exception as e:
+                # Silently fail - cache file might be corrupted
                 pass
         
         if cached_invoices:
             # Use cached data for fast lookup
             invoices = cached_invoices
             
+            # Debug: Count invoices for this customer
+            customer_invoices = [inv for inv in invoices if inv.get('customerId', '') == customer_id]
+            
             # Filter invoices for this customer and date
             valid_invoices = []
             for invoice in invoices:
                 invoice_customer_id = invoice.get('customerId', '')
                 invoice_date_str = invoice.get('issueDate', '')
+                invoice_status = invoice.get('status', '').upper()
+                invoice_source = invoice.get('source', '').upper()
                 
-                # Check customer match and status
-                if (invoice_customer_id == customer_id and 
-                    invoice.get('status', '').upper() != 'DELETED' and 
-                    invoice.get('source', '').upper() == 'TABS'):
-                    
-                    # If we have a specific date, filter by date
-                    if issue_date and invoice_date_str:
-                        try:
-                            if 'T' in invoice_date_str:
-                                invoice_date = pd.to_datetime(invoice_date_str).date()
-                            else:
-                                invoice_date = pd.to_datetime(invoice_date_str).date()
-                            
-                            if invoice_date == issue_date:
-                                valid_invoices.append(invoice)
-                        except:
-                            # If date parsing fails, include the invoice anyway
+                # Check customer match first
+                if invoice_customer_id != customer_id:
+                    continue
+                
+                # Check status and source
+                if invoice_status == 'DELETED':
+                    continue
+                if invoice_source != 'TABS':
+                    continue
+                
+                # If we have a specific date, filter by date
+                if issue_date and invoice_date_str:
+                    try:
+                        # Convert issue_date to date object if it's not already
+                        if isinstance(issue_date, str):
+                            issue_date_obj = pd.to_datetime(issue_date).date()
+                        elif hasattr(issue_date, 'date'):
+                            issue_date_obj = issue_date.date()
+                        else:
+                            issue_date_obj = issue_date
+                        
+                        # Parse invoice date (handle both ISO format with T and without)
+                        invoice_date = pd.to_datetime(invoice_date_str).date()
+                        
+                        if invoice_date == issue_date_obj:
                             valid_invoices.append(invoice)
-                    else:
-                        # No specific date, include all valid invoices
+                    except Exception as e:
+                        # If date parsing fails, include the invoice anyway (like reference_code.py)
                         valid_invoices.append(invoice)
+                else:
+                    # No specific date, include all valid invoices
+                    valid_invoices.append(invoice)
             
             if valid_invoices:
                 # Sort by issue date (most recent first) and return the first one
@@ -662,64 +727,9 @@ def find_invoice_by_date(customer_id, issue_date, api_token):
                 selected_invoice = valid_invoices[0]
                 invoice_id = selected_invoice.get('id')
                 return invoice_id
-            else:
-                # Cache exists but no matching invoices found
-                return None
         
-        # If no cached data at all, try to fetch and cache
-        all_invoices = fetch_all_invoices_for_cache(api_token)
-        
-        if all_invoices:
-            # Cache the results for future use
-            st.session_state[cache_key] = all_invoices
-            
-            # Also save to persistent cache file
-            try:
-                import json
-                _ensure_cache_dir_exists()
-                cache_file = os.path.join(_CACHE_DIR, f"invoice_cache_{api_token[:10]}.json")
-                cache_data = {
-                    'invoices': all_invoices,
-                    'timestamp': datetime.now().isoformat(),
-                    'count': len(all_invoices)
-                }
-                with open(cache_file, 'w') as f:
-                    json.dump(cache_data, f)
-            except Exception:
-                pass
-            
-            # Now filter the freshly fetched invoices
-            invoices = all_invoices
-            valid_invoices = []
-            for invoice in invoices:
-                invoice_customer_id = invoice.get('customerId', '')
-                invoice_date_str = invoice.get('issueDate', '')
-                
-                if (invoice_customer_id == customer_id and 
-                    invoice.get('status', '').upper() != 'DELETED' and 
-                    invoice.get('source', '').upper() == 'TABS'):
-                    
-                    if issue_date and invoice_date_str:
-                        try:
-                            if 'T' in invoice_date_str:
-                                invoice_date = pd.to_datetime(invoice_date_str).date()
-                            else:
-                                invoice_date = pd.to_datetime(invoice_date_str).date()
-                            
-                            if invoice_date == issue_date:
-                                valid_invoices.append(invoice)
-                        except:
-                            valid_invoices.append(invoice)
-                    else:
-                        valid_invoices.append(invoice)
-            
-            if valid_invoices:
-                valid_invoices.sort(key=lambda x: x.get('issueDate', ''), reverse=True)
-                selected_invoice = valid_invoices[0]
-                invoice_id = selected_invoice.get('id')
-                return invoice_id
-        
-        # If no cached data or no match found, return None
+        # If no cached data, return None (don't fetch from API here - that should be done via Refresh Cache button)
+        # This matches the reference_code.py behavior - it doesn't fetch if cache is empty
         return None
         
     except Exception as e:
@@ -2951,7 +2961,6 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
     validation_api_key = api_key if api_key else API_KEY
     
     if validation_api_key and validation_api_key.strip():
-        st.write("🔍 Validating event types against API...")
         # Only validate rows with valid customer IDs from income/LBPA files
         validation_mask = valid_customer_mask.copy()
         
@@ -3100,12 +3109,10 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
                 total_validated = len(combined_internal[validation_mask])
                 validated_count = total_validated - unmatched_count
                 
-                if corrections_made > 0:
-                    st.write(f"✅ Corrected {corrections_made} event type names using API mapping")
                 if unmatched_count > 0:
                     st.warning(f"⚠️ {unmatched_count} of {total_validated} rows have event types not found in API for their customer")
-                if corrections_made == 0 and unmatched_count == 0:
-                    st.write(f"✅ All {validated_count} event types validated against API")
+                elif corrections_made > 0:
+                    st.success(f"✅ Validated {validated_count} event types against API")
             else:
                 # No customer_event_types from validation, initialize empty
                 customer_event_types = {}
@@ -4378,7 +4385,8 @@ with chunk_tab:
             if not cached_invoices:
                 try:
                     import json
-                    cache_file = f"invoice_cache_{api_key_attach[:10]}.json"
+                    cache_file = os.path.join(_CACHE_DIR, f"invoice_cache_{api_key_attach[:10]}.json")
+                    os.makedirs(_CACHE_DIR, exist_ok=True)
                     if os.path.exists(cache_file):
                         with open(cache_file, 'r') as f:
                             cache_data = json.load(f)
@@ -4425,7 +4433,8 @@ with chunk_tab:
                                 # Also save to file for persistence
                                 try:
                                     import json
-                                    cache_file = f"invoice_cache_{api_key_attach[:10]}.json"
+                                    cache_file = os.path.join(_CACHE_DIR, f"invoice_cache_{api_key_attach[:10]}.json")
+                                    os.makedirs(_CACHE_DIR, exist_ok=True)
                                     cache_data = {
                                         'invoices': all_invoices,
                                         'timestamp': datetime.now().isoformat(),
@@ -4451,7 +4460,8 @@ with chunk_tab:
                     
                     # Also clear from file
                     try:
-                        cache_file = f"invoice_cache_{api_key_attach[:10]}.json"
+                        cache_file = os.path.join(_CACHE_DIR, f"invoice_cache_{api_key_attach[:10]}.json")
+                        os.makedirs(_CACHE_DIR, exist_ok=True)
                         if os.path.exists(cache_file):
                             os.remove(cache_file)
                         st.success("✅ Cache cleared! (Both memory and file)")
@@ -4548,16 +4558,6 @@ with chunk_tab:
                             if len(unmapped) > 0:
                                 st.warning(f"⚠️ {len(unmapped)} Split CSVs Requiring Attention")
                                 st.dataframe(unmapped, use_container_width=True)
-                            
-                            # Download mapping CSV
-                            if len(mapping_df) > 0:
-                                mapping_csv_bytes = mapping_df.to_csv(index=False).encode("utf-8")
-                                st.download_button(
-                                    "Download Invoice Mapping CSV",
-                                    data=mapping_csv_bytes,
-                                    file_name=f"invoice_mapping_{datetime.now().strftime('%Y%m%d')}.csv",
-                                    key="dl_invoice_mapping"
-                                )
     
     elif current_step == 2:  # Step 3: Bulk Upload
         st.subheader("Bulk Upload CSV Attachments")
@@ -4834,7 +4834,8 @@ with chunk_tab:
             if not cached_invoices:
                 try:
                     import json
-                    cache_file = f"invoice_cache_{api_key_attach[:10]}.json"
+                    cache_file = os.path.join(_CACHE_DIR, f"invoice_cache_{api_key_attach[:10]}.json")
+                    os.makedirs(_CACHE_DIR, exist_ok=True)
                     if os.path.exists(cache_file):
                         with open(cache_file, 'r') as f:
                             cache_data = json.load(f)
@@ -4881,7 +4882,8 @@ with chunk_tab:
                                 # Also save to file for persistence
                                 try:
                                     import json
-                                    cache_file = f"invoice_cache_{api_key_attach[:10]}.json"
+                                    cache_file = os.path.join(_CACHE_DIR, f"invoice_cache_{api_key_attach[:10]}.json")
+                                    os.makedirs(_CACHE_DIR, exist_ok=True)
                                     cache_data = {
                                         'invoices': all_invoices,
                                         'timestamp': datetime.now().isoformat(),
@@ -4907,7 +4909,8 @@ with chunk_tab:
                     
                     # Also clear from file
                     try:
-                        cache_file = f"invoice_cache_{api_key_attach[:10]}.json"
+                        cache_file = os.path.join(_CACHE_DIR, f"invoice_cache_{api_key_attach[:10]}.json")
+                        os.makedirs(_CACHE_DIR, exist_ok=True)
                         if os.path.exists(cache_file):
                             os.remove(cache_file)
                         st.success("✅ Cache cleared! (Both memory and file)")
@@ -5004,16 +5007,6 @@ with chunk_tab:
                             if len(unmapped) > 0:
                                 st.warning(f"⚠️ {len(unmapped)} Split CSVs Requiring Attention")
                                 st.dataframe(unmapped, use_container_width=True)
-                            
-                            # Download mapping CSV
-                            if len(mapping_df) > 0:
-                                mapping_csv_bytes = mapping_df.to_csv(index=False).encode("utf-8")
-                                st.download_button(
-                                    "Download Invoice Mapping CSV",
-                                    data=mapping_csv_bytes,
-                                    file_name=f"invoice_mapping_{datetime.now().strftime('%Y%m%d')}.csv",
-                                    key="dl_invoice_mapping"
-                                )
     
     elif current_step == 2:  # Step 3: Bulk Upload
         st.subheader("Bulk Upload CSV Attachments")
@@ -5446,16 +5439,6 @@ with chunk_tab:
                         st.success(f"✅ **Invoice mapping completed!**")
                         st.info(f"**Results:** {len(mapping_df)} split CSVs successfully mapped, {len(problematic_split_csvs)} split CSVs need attention")
                         st.dataframe(mapping_df, use_container_width=True)
-                        
-                        # Download button for successful mappings
-                        if len(mapping_df) > 0:
-                            csv_bytes = mapping_df.to_csv(index=False).encode('utf-8')
-                            st.download_button(
-                                "Download Invoice Mapping CSV",
-                                data=csv_bytes,
-                                file_name="invoice_mapping_successful.csv",
-                                mime="text/csv"
-                            )
                     else:
                         st.error("No valid invoice mappings could be created")
                     

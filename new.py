@@ -2022,7 +2022,7 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
     # If we have customer file mapping, use it as primary source
     if account_id_to_customer_from_file:
         account_id_to_customer_from_custom_field = account_id_to_customer_from_file.copy()
-        st.write(f"✅ Loaded {len(account_id_to_customer_from_custom_field):,} customer mappings from file")
+        # Customer mappings loaded silently
 
     # Build AccountID -> account name mapping for Finastra accounts from ORIGINAL dataframes
     # This ensures we capture all Finastra rows before any grouping/aggregation
@@ -3105,25 +3105,33 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
                     else:
                         unmatched_count += 1
                 
-                # Show summary
+                # Show summary - store for combined message later
                 total_validated = len(combined_internal[validation_mask])
                 validated_count = total_validated - unmatched_count
-                
-                if unmatched_count > 0:
-                    st.warning(f"⚠️ {unmatched_count} of {total_validated} rows have event types not found in API for their customer")
-                elif corrections_made > 0:
-                    st.success(f"✅ Validated {validated_count} event types against API")
+                # Store event type validation stats for combined message
+                event_type_corrections = corrections_made
+                event_type_validated = validated_count
+                event_type_unmatched = unmatched_count
             else:
                 # No customer_event_types from validation, initialize empty
                 customer_event_types = {}
+                event_type_corrections = 0
+                event_type_validated = 0
+                event_type_unmatched = 0
         else:
             # No unique customer IDs, initialize empty
             customer_event_types = {}
+            event_type_corrections = 0
+            event_type_validated = 0
+            event_type_unmatched = 0
     else:
         # No API key provided, initialize empty
         customer_event_types = {}
+        event_type_corrections = 0
+        event_type_validated = 0
+        event_type_unmatched = 0
     
-    st.write("📊 Generating usage file...")
+    # Generating usage file...
     # Separate unmapped rows (customer_id is missing AND CustomerName is still numeric/account ID)
     # Use the same logic as valid_customer_mask to identify invalid customer_ids
     customer_id_missing = (
@@ -3135,12 +3143,21 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
     customer_name_is_numeric = combined_internal["CustomerName"].astype(str).str.match(r'^\d+$', na=False)
     unmapped_mask = customer_id_missing & customer_name_is_numeric
     
-    # Show summary of mapping results
+    # Show combined summary of mapping results
     total_rows = len(combined_internal)
     mapped_rows = total_rows - customer_id_missing.sum()
     unmapped_rows = customer_id_missing.sum()
-    if unmapped_rows > 0:
-        st.warning(f"⚠️ {unmapped_rows:,} of {total_rows:,} rows could not be matched to customer IDs")
+    
+    # Build combined message
+    message_parts = []
+    if mapped_rows > 0:
+        message_parts.append(f"{mapped_rows:,} of {total_rows:,} rows mapped to customer IDs")
+    if event_type_validated > 0:
+        message_parts.append(f"{event_type_validated:,} event types validated")
+    
+    if message_parts:
+        combined_message = "✅ " + ", ".join(message_parts)
+        st.success(combined_message)
     
     # Also check for rows with invalid customer_id (not just missing, but also "nan", "None", empty)
     invalid_customer_mask = (

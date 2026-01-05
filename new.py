@@ -1902,7 +1902,7 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
         # Preserve original account name if it exists
         if "__original_account_name__" in df.columns:
             agg_dict["__original_account_name__"] = "first"
-        # Preserve AccountID column if it exists (needed for Finastra differentiators)
+        # Preserve AccountID column if it exists
         if "AccountID" in df.columns:
             agg_dict["AccountID"] = "first"
         # Preserve __acct_key__ (CustomerNumber) for customer_id mapping
@@ -1955,7 +1955,7 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
         return_cols = ["customer_id", "AccountName", "event_type_name", "datetime", "value", "differentiator", "account_id"]
         if "__original_account_name__" in grouped.columns:
             return_cols.append("__original_account_name__")
-        # Include AccountID if it exists (needed for Finastra differentiators)
+        # Include AccountID if it exists
         if "AccountID" in grouped.columns:
             return_cols.append("AccountID")
         # Include __finastra_account_id__ if it exists (for Finastra differentiators)
@@ -2220,41 +2220,15 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
         mapped_differentiators = pd.Series(index=finastra_rows.index, dtype=str)
         
         if account_id_to_name_map:
-            # Method 1: Use AccountID column directly (for Finastra, this is the actual AccountID, not CustomerNumber)
-            if "AccountID" in finastra_rows.columns:
-                finastra_account_ids = finastra_rows["AccountID"].astype(str).str.replace(r"[^0-9]", "", regex=True)
+            # Use __finastra_account_id__ column only (no AccountID fallback)
+            if "__finastra_account_id__" in finastra_rows.columns:
+                finastra_account_ids = finastra_rows["__finastra_account_id__"].astype(str).str.replace(r"[^0-9]", "", regex=True)
                 mapped_by_account_id = finastra_account_ids.map(account_id_to_name_map)
                 mapped_differentiators = mapped_by_account_id.fillna("")
-            
-            # Method 2: Fallback to __finastra_account_id__ column if AccountID not available
-            unmapped_mask = mapped_differentiators == ""
-            if unmapped_mask.any() and "__finastra_account_id__" in finastra_rows.columns:
-                unmapped_rows = finastra_rows[unmapped_mask]
-                finastra_account_ids_fallback = unmapped_rows["__finastra_account_id__"].astype(str).str.replace(r"[^0-9]", "", regex=True)
-                mapped_by_account_id_fallback = finastra_account_ids_fallback.map(account_id_to_name_map)
-                for idx in unmapped_rows.index:
-                    if idx in mapped_by_account_id_fallback.index and mapped_by_account_id_fallback.loc[idx]:
-                        mapped_differentiators.loc[idx] = mapped_by_account_id_fallback.loc[idx]
-            
-            # Method 3: Use AccountID_from_income if available
-            unmapped_mask = mapped_differentiators == ""
-            if unmapped_mask.any() and "AccountID_from_income" in finastra_rows.columns:
-                unmapped_rows = finastra_rows[unmapped_mask]
-                for idx in unmapped_rows.index:
-                    account_id_raw = str(unmapped_rows.loc[idx, "AccountID_from_income"]).strip()
-                    if account_id_raw and account_id_raw.lower() not in ["nan", "none", ""]:
-                        account_id = re.sub(r"[^0-9]", "", account_id_raw)
-                        if account_id and account_id in account_id_to_name_map:
-                            mapped_differentiators.loc[idx] = account_id_to_name_map[account_id]
-            
-            # Method 4: Use original_account_name directly as fallback (renamed from __original_account_name__)
-            unmapped_mask = mapped_differentiators == ""
-            if unmapped_mask.any() and "original_account_name" in finastra_rows.columns:
-                unmapped_rows = finastra_rows[unmapped_mask]
-                for idx in unmapped_rows.index:
-                    original_name = str(unmapped_rows.loc[idx, "original_account_name"]).strip()
-                    if original_name and original_name.lower() != "nan":
-                        mapped_differentiators.loc[idx] = original_name
+            else:
+                # If __finastra_account_id__ is missing, leave differentiator empty
+                mapped_differentiators = pd.Series(index=finastra_rows.index, dtype=str)
+                mapped_differentiators[:] = ""
             
             df.loc[finastra_mask, "differentiator"] = mapped_differentiators
         else:
@@ -2527,7 +2501,7 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
     )
     
     # Only set differentiator for Finastra rows that don't already have one
-    # This preserves the differentiators set by set_finastra_differentiators which uses AccountID
+    # This preserves the differentiators set by set_finastra_differentiators which uses __finastra_account_id__
     if finastra_mask.any():
         finastra_rows_mask = finastra_mask & (
             combined_internal["differentiator"].isna() | 
@@ -2535,17 +2509,15 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
         )
         
         if finastra_rows_mask.any() and account_id_to_name:
-            # Fill in missing differentiators using __finastra_account_id__
+            # Fill in missing differentiators using __finastra_account_id__ only (no AccountID fallback)
             finastra_rows = combined_internal[finastra_rows_mask].copy()
             if "__finastra_account_id__" in finastra_rows.columns:
                 finastra_account_ids = finastra_rows["__finastra_account_id__"].astype(str).str.replace(r"[^0-9]", "", regex=True)
                 mapped_differentiators = finastra_account_ids.map(account_id_to_name)
-            elif "AccountID" in finastra_rows.columns:
-                # Fallback to AccountID column if __finastra_account_id__ not available
-                finastra_account_ids = finastra_rows["AccountID"].astype(str).str.replace(r"[^0-9]", "", regex=True)
-                mapped_differentiators = finastra_account_ids.map(account_id_to_name)
             else:
+                # If __finastra_account_id__ is missing, leave differentiator empty
                 mapped_differentiators = pd.Series(index=finastra_rows.index, dtype=str)
+                mapped_differentiators[:] = ""
             
             # Fill in any unmapped ones using original_account_name as fallback (renamed from __original_account_name__)
             unmapped_mask = mapped_differentiators.isna() | (mapped_differentiators == "")
@@ -2802,8 +2774,8 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
     
     # Generating usage file...
     # Separate unmapped rows (customer_id is missing AND CustomerName is still numeric/account ID)
-    # Use the same logic as valid_customer_mask to identify invalid customer_ids
-    customer_id_missing = combined_internal["customer_id"].isna()
+    # Derive customer_id_missing as the inverse of valid_customer_mask
+    customer_id_missing = ~valid_customer_mask
     customer_name_is_numeric = combined_internal["CustomerName"].astype(str).str.match(r'^\d+$', na=False)
     unmapped_mask = customer_id_missing & customer_name_is_numeric
     
@@ -2824,7 +2796,8 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
         st.success(combined_message)
     
     # Also check for rows with invalid customer_id (missing)
-    invalid_customer_mask = combined_internal["customer_id"].isna()
+    # Derive invalid_customer_mask as the inverse of valid_customer_mask
+    invalid_customer_mask = ~valid_customer_mask
     
     # Clear event_type_name for rows without customer_id (can't be validated against API)
     combined_internal.loc[customer_id_missing, "event_type_name"] = ""
@@ -2873,26 +2846,10 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
         
         # Recalculate UnitsAsPerSubmission and IsInitialSubmission from the original grouped data
         # to avoid double-counting when combining "app" and "unit" rows
-        # Also ensure event_type_name matches what customer has in obligations
-        # Reuse customer_event_types from validation (already fetched above)
-        if "customer_id" in combined.columns and customer_event_types:
-            # Map API event types to standard names
-            api_to_standard_map = {
-                "app": "app",
-                "per application": "app",
-                "unit": "unit",
-                "units": "unit",
-                "lbpa app": "LBPA app",
-                "lbpa application": "LBPA app",
-                "lbpa unit": "LBPA unit",
-                "lbpa units": "LBPA unit",
-            }
-            
+        if "customer_id" in combined.columns:
             for idx, row in combined.iterrows():
                 customer_id = row["customer_id"]
                 differentiator = row.get("differentiator", "")
-                application_type = row.get("ApplicationTypeName", "")
-                current_event_type_before = row.get("event_type_name", "")
                 
                 # Find matching rows in mapped_df
                 if differentiator:
@@ -2907,95 +2864,6 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
                     first_row = matching_rows.iloc[0]
                     combined.loc[idx, "UnitsAsPerSubmission"] = first_row.get("UnitsAsPerSubmission", 0)
                     combined.loc[idx, "IsInitialSubmission"] = first_row.get("IsInitialSubmission", 0)
-                
-                # Set event_type_name directly from what customer has in obligations
-                # Try both direct lookup and string comparison
-                customer_event_types_key = None
-                if customer_id in customer_event_types:
-                    customer_event_types_key = customer_id
-                else:
-                    # Try string matching
-                    for cid in customer_event_types.keys():
-                        if str(cid).strip() == str(customer_id).strip():
-                            customer_event_types_key = cid
-                            break
-                
-                if customer_event_types_key:
-                    valid_event_types = customer_event_types[customer_event_types_key]
-                    # Map API event types to standard names
-                    customer_standard_types = set()
-                    for et in valid_event_types:
-                        et_lower = et.lower()
-                        if et_lower in api_to_standard_map:
-                            customer_standard_types.add(api_to_standard_map[et_lower])
-                    
-                    # For Income: prioritize what customer has in obligations
-                    # Standard event types: "app" or "unit"
-                    if application_type == "Income":
-                        # Check what event type is in the original data
-                        original_event_types = set()
-                        if len(matching_rows) > 0 and "event_type_name" in matching_rows.columns:
-                            original_event_types = set(matching_rows["event_type_name"].unique())
-                        
-                        # Check if original data has "app" or "unit"
-                        has_app_in_data = "app" in original_event_types
-                        has_unit_in_data = "unit" in original_event_types
-                        
-                        # Prioritize what customer has in obligations over original data
-                        has_app_in_obligations = "app" in customer_standard_types
-                        has_unit_in_obligations = "unit" in customer_standard_types
-                        
-                        # If customer only has one option in obligations, use it regardless of original data
-                        if has_unit_in_obligations and not has_app_in_obligations:
-                            # Customer only has "unit" - use "unit"
-                            combined.loc[idx, "event_type_name"] = "unit"
-                        elif has_app_in_obligations and not has_unit_in_obligations:
-                            # Customer only has "app" - use "app"
-                            combined.loc[idx, "event_type_name"] = "app"
-                        elif has_unit_in_obligations and has_app_in_obligations:
-                            # Customer has both - use what's in original data if it matches
-                            if has_unit_in_data and "unit" in customer_standard_types:
-                                combined.loc[idx, "event_type_name"] = "unit"
-                            elif has_app_in_data and "app" in customer_standard_types:
-                                combined.loc[idx, "event_type_name"] = "app"
-                            else:
-                                # Default to unit when both are available
-                                combined.loc[idx, "event_type_name"] = "unit"
-                        # else: Customer has neither - keep current
-                    
-                    # For LBPA: prioritize what customer has in obligations
-                    # Standard event types: "LBPA app" or "LBPA unit"
-                    elif application_type == "LBPA":
-                        # Check what event type is in the original data
-                        original_event_types = set()
-                        if len(matching_rows) > 0 and "event_type_name" in matching_rows.columns:
-                            original_event_types = set(matching_rows["event_type_name"].unique())
-                        
-                        # Check if original data has "LBPA app" or "LBPA unit"
-                        has_lbpa_app_in_data = "LBPA app" in original_event_types
-                        has_lbpa_unit_in_data = "LBPA unit" in original_event_types
-                        
-                        # Prioritize what customer has in obligations over original data
-                        has_lbpa_app_in_obligations = "LBPA app" in customer_standard_types
-                        has_lbpa_unit_in_obligations = "LBPA unit" in customer_standard_types
-                        
-                        # If customer only has one option in obligations, use it regardless of original data
-                        if has_lbpa_unit_in_obligations and not has_lbpa_app_in_obligations:
-                            # Customer only has "LBPA unit" - use "LBPA unit"
-                            combined.loc[idx, "event_type_name"] = "LBPA unit"
-                        elif has_lbpa_app_in_obligations and not has_lbpa_unit_in_obligations:
-                            # Customer only has "LBPA app" - use "LBPA app"
-                            combined.loc[idx, "event_type_name"] = "LBPA app"
-                        elif has_lbpa_unit_in_obligations and has_lbpa_app_in_obligations:
-                            # Customer has both - use what's in original data if it matches
-                            if has_lbpa_unit_in_data and "LBPA unit" in customer_standard_types:
-                                combined.loc[idx, "event_type_name"] = "LBPA unit"
-                            elif has_lbpa_app_in_data and "LBPA app" in customer_standard_types:
-                                combined.loc[idx, "event_type_name"] = "LBPA app"
-                            else:
-                                # Default to LBPA unit when both are available
-                                combined.loc[idx, "event_type_name"] = "LBPA unit"
-                        # If neither, keep current (shouldn't happen)
         
         # Set value based on event_type_name:
         # - "app" events use IsInitialSubmission

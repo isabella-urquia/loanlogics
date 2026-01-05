@@ -1025,6 +1025,79 @@ def find_column(df: pd.DataFrame, candidates: list[str]) -> str | None:
 # Custom field ID for Customer Number (stores NetSuite Account ID)
 CUSTOMER_NUMBER_FIELD_ID = "edaefe3e-46b9-4212-957b-8140df8e2890"
 
+def match_customer_id_by_name_fallback(
+    df_with_customer: pd.DataFrame,
+    account_id_name_to_customer: dict,
+    account_name_to_customer: dict,
+    account_id_col: str = "CustomerNumber",
+    account_name_col: str = "AccountName",
+    extract_account_id_func = None
+) -> tuple[pd.DataFrame, int]:
+    """
+    Centralized helper function to match customer_id using AccountName/CustomerName with normalized name logic.
+    
+    Returns:
+        tuple: (updated_dataframe, matched_count)
+    """
+    matched_count = 0
+    
+    # Find unmapped rows
+    # If account_id_col exists, use it for filtering; otherwise just check for unmapped customer_id
+    if account_id_col in df_with_customer.columns:
+        unmapped_mask = df_with_customer["customer_id"].isna() & df_with_customer[account_id_col].notna()
+    else:
+        unmapped_mask = df_with_customer["customer_id"].isna()
+    
+    if not unmapped_mask.any():
+        return df_with_customer, 0
+    
+    unmapped_rows = df_with_customer[unmapped_mask].copy()
+    
+    # First try AccountID + AccountName matching (if available and account_id_col exists)
+    if account_id_name_to_customer and account_name_col in df_with_customer.columns and account_id_col in df_with_customer.columns:
+        for idx, row in unmapped_rows.iterrows():
+            if extract_account_id_func:
+                account_id = extract_account_id_func(row[account_id_col])
+            else:
+                account_id_raw = row[account_id_col]
+                account_id = re.sub(r"[^0-9]", "", str(account_id_raw)) if pd.notna(account_id_raw) else ""
+            
+            account_name = str(row.get(account_name_col, "")).strip()
+            
+            if account_id and account_name:
+                # Normalize name for matching
+                normalized_name = re.sub(r"[^a-z0-9]", "", account_name.lower())
+                # Try to find match using AccountID + AccountName
+                if (account_id, normalized_name) in account_id_name_to_customer:
+                    df_with_customer.loc[idx, "customer_id"] = account_id_name_to_customer[(account_id, normalized_name)]
+                    matched_count += 1
+    
+    # Final fallback: Match by AccountName if AccountID doesn't match
+    # This handles cases like Finastra where multiple AccountIDs map to same customer
+    if account_id_col in df_with_customer.columns:
+        still_unmapped_after = df_with_customer[df_with_customer["customer_id"].isna() & df_with_customer[account_id_col].notna()]
+    else:
+        still_unmapped_after = df_with_customer[df_with_customer["customer_id"].isna()]
+    
+    if len(still_unmapped_after) > 0 and account_name_to_customer and account_name_col in df_with_customer.columns:
+        for idx, row in still_unmapped_after.iterrows():
+            account_name = str(row.get(account_name_col, "")).strip()
+            if account_name:
+                # Try full normalized name first
+                normalized_name = re.sub(r"[^a-z0-9]", "", account_name.lower())
+                if normalized_name in account_name_to_customer:
+                    df_with_customer.loc[idx, "customer_id"] = account_name_to_customer[normalized_name]
+                    matched_count += 1
+                else:
+                    # Try base name (before " - " or similar separators)
+                    base_name = account_name.split(" - ")[0].split(" – ")[0].split("-")[0].strip()
+                    base_normalized = re.sub(r"[^a-z0-9]", "", base_name.lower())
+                    if base_normalized in account_name_to_customer:
+                        df_with_customer.loc[idx, "customer_id"] = account_name_to_customer[base_normalized]
+                        matched_count += 1
+    
+    return df_with_customer, matched_count
+
 def extract_account_id_from_entity_id(entity_id: str) -> str | None:
     """Extract the numeric Account ID from NetSuite entityId.
     Example: '8516 Regions Bank - NMS' -> '8516'
@@ -2383,8 +2456,7 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
     combined_internal.loc[lbpa_mask & (combined_internal["event_type_name"] == "Per Application"), "event_type_name"] = "LBPA app"
     combined_internal.loc[lbpa_mask & (combined_internal["event_type_name"] == "Units"), "event_type_name"] = "LBPA unit"
     
-    # Ensure customer_id is populated and string type AFTER resolution
-    combined_internal["customer_id"] = combined_internal["customer_id"].astype(str)
+    # Keep customer_id as nullable until final CSV export
     
     # Direct Finastra fallback: Apply Finastra customer_id to any Finastra rows that still don't have it
     if finastra_customer_id_from_file:
@@ -2398,19 +2470,12 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
         if name_col:
             finastra_mask = (
                 combined_internal[name_col].astype(str).str.contains("Finastra", case=False, na=False) &
-                (combined_internal["customer_id"].isna() | 
-                 (combined_internal["customer_id"] == "nan") |
-                 (combined_internal["customer_id"] == "None") |
-                 (combined_internal["customer_id"].str.strip() == ""))
+                combined_internal["customer_id"].isna()
             )
             if finastra_mask.any():
                 combined_internal.loc[finastra_mask, "customer_id"] = finastra_customer_id_from_file
     
-    valid_customer_mask = (
-        (combined_internal["customer_id"] != "nan") &
-        (combined_internal["customer_id"] != "None") &
-        (combined_internal["customer_id"].str.strip() != "")
-    )
+    valid_customer_mask = combined_internal["customer_id"].notna()
     
     # NOW calculate sums AFTER customer_id resolution
     # Sum UnitsAsPerSubmission and IsInitialSubmission directly from Income and LBPA files per customer_id
@@ -2421,19 +2486,23 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
     if "account_id" in combined_internal.columns and "customer_id" in combined_internal.columns:
         valid_mapping_mask = (
             combined_internal["customer_id"].notna() &
-            (combined_internal["customer_id"].astype(str).str.strip() != "") &
-            (combined_internal["customer_id"].astype(str).str.strip().str.lower() != "nan") &
             combined_internal["account_id"].notna()
         )
         mapping_df = combined_internal[valid_mapping_mask][["account_id", "customer_id"]].drop_duplicates()
         account_to_customer_mapping = dict(zip(
             mapping_df["account_id"].astype(str).str.replace(r"[^0-9]", "", regex=True),
-            mapping_df["customer_id"].astype(str)
+            mapping_df["customer_id"]
         ))
     
     # Map customer_id to Income and LBPA files using account_id
     income_df_with_customer = income_df.copy()
     lbpa_df_with_customer = lbpa_df.copy()
+    
+    # Initialize customer_id columns once (keep as nullable until final CSV export)
+    if "customer_id" not in income_df_with_customer.columns:
+        income_df_with_customer["customer_id"] = None
+    if "customer_id" not in lbpa_df_with_customer.columns:
+        lbpa_df_with_customer["customer_id"] = None
     
     # Map customer_id to Income file using CustomerNumber column - prefer Customer Number column from customer file
     if "CustomerNumber" in income_df_with_customer.columns:
@@ -2458,84 +2527,39 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
         
         # Continue with additional fallback matching (AccountID + AccountName, name matching, etc.)
         if account_id_to_customer_from_file and income_df_with_customer["customer_id"].isna().any():
-            # For unmapped AccountIDs, try AccountID + AccountName matching
-            # This handles the case where a customer (like Finastra) has multiple AccountIDs, each with a different AccountName
-            unmapped_mask = income_df_with_customer["customer_id"].isna() & income_df_with_customer["CustomerNumber"].notna()
-            if unmapped_mask.any():
-                unmapped_rows = income_df_with_customer[unmapped_mask].copy()
-                
-                # First try AccountID + AccountName matching (if available)
-                if account_id_name_to_customer_from_file and "AccountName" in income_df_with_customer.columns:
-                    for idx, row in unmapped_rows.iterrows():
-                        account_id = extract_account_id_from_customer_number(row["CustomerNumber"])
-                        account_name = str(row.get("AccountName", "")).strip()
-                        
-                        if account_id and account_name:
-                            # Normalize name for matching
-                            normalized_name = re.sub(r"[^a-z0-9]", "", account_name.lower())
-                            # Try to find match using AccountID + AccountName
-                            if (account_id, normalized_name) in account_id_name_to_customer_from_file:
-                                income_df_with_customer.loc[idx, "customer_id"] = account_id_name_to_customer_from_file[(account_id, normalized_name)]
-                
-                # Fallback: If AccountID exists in customer file but AccountName doesn't match,
-                # still use the customer_id (for cases where same customer has multiple AccountIDs)
-                # This handles Finastra case where AccountID might match but AccountName format differs
-                still_unmapped_mask = income_df_with_customer["customer_id"].isna() & income_df_with_customer["CustomerNumber"].notna()
-                if still_unmapped_mask.any() and account_id_to_customer_from_file:
-                    still_unmapped = income_df_with_customer[still_unmapped_mask].copy()
-                    matched_count = 0
-                    for idx, row in still_unmapped.iterrows():
-                        account_id = extract_account_id_from_customer_number(row["CustomerNumber"])
-                        # If AccountID exists in customer file, use it (even if AccountName doesn't match)
-                        if account_id and account_id in account_id_to_customer_from_file:
-                            income_df_with_customer.loc[idx, "customer_id"] = account_id_to_customer_from_file[account_id]
-                            matched_count += 1
-                    if matched_count > 0:
-                        st.write(f"   ✅ Matched {matched_count} additional rows using AccountID fallback")
-                    
-                    # Final fallback: Match by AccountName if AccountID doesn't match
-                    # This handles cases like Finastra where multiple AccountIDs map to same customer
-                    still_unmapped_after = income_df_with_customer[income_df_with_customer["customer_id"].isna() & income_df_with_customer["CustomerNumber"].notna()]
-                    if len(still_unmapped_after) > 0 and account_name_to_customer_from_file and "AccountName" in income_df_with_customer.columns:
-                        name_matched_count = 0
-                        for idx, row in still_unmapped_after.iterrows():
-                            account_name = str(row.get("AccountName", "")).strip()
-                            if account_name:
-                                # Try full normalized name first
-                                normalized_name = re.sub(r"[^a-z0-9]", "", account_name.lower())
-                                if normalized_name in account_name_to_customer_from_file:
-                                    income_df_with_customer.loc[idx, "customer_id"] = account_name_to_customer_from_file[normalized_name]
-                                    name_matched_count += 1
-                                else:
-                                    # Try base name (before " - " or similar separators)
-                                    base_name = account_name.split(" - ")[0].split(" – ")[0].split("-")[0].strip()
-                                    base_normalized = re.sub(r"[^a-z0-9]", "", base_name.lower())
-                                    if base_normalized in account_name_to_customer_from_file:
-                                        income_df_with_customer.loc[idx, "customer_id"] = account_name_to_customer_from_file[base_normalized]
-                                        name_matched_count += 1
-                        if name_matched_count > 0:
-                            st.write(f"   ✅ Matched {name_matched_count} additional rows using AccountName matching")
-                    
-                    # Hardcoded fallback: Match Finastra rows to Finastra customer_id from customer file
-                    # This handles cases where Finastra has multiple AccountIDs not in the customer file
-                    if finastra_customer_id_from_file:
-                        # Check both CustomerName and AccountName columns
-                        name_col = "CustomerName" if "CustomerName" in income_df_with_customer.columns else "AccountName"
-                        if name_col in income_df_with_customer.columns:
-                            finastra_mask = income_df_with_customer[name_col].astype(str).str.contains("Finastra", case=False, na=False) & income_df_with_customer["customer_id"].isna()
-                            finastra_count = finastra_mask.sum()
-                            if finastra_count > 0:
-                                income_df_with_customer.loc[finastra_mask, "customer_id"] = finastra_customer_id_from_file
+            # Fallback: If AccountID exists in customer file but AccountName doesn't match,
+            # still use the customer_id (for cases where same customer has multiple AccountIDs)
+            # This handles Finastra case where AccountID might match but AccountName format differs
+            still_unmapped_mask = income_df_with_customer["customer_id"].isna() & income_df_with_customer["CustomerNumber"].notna()
+            if still_unmapped_mask.any() and account_id_to_customer_from_file:
+                still_unmapped = income_df_with_customer[still_unmapped_mask].copy()
+                matched_count = 0
+                for idx, row in still_unmapped.iterrows():
+                    account_id = extract_account_id_from_customer_number(row["CustomerNumber"])
+                    # If AccountID exists in customer file, use it (even if AccountName doesn't match)
+                    if account_id and account_id in account_id_to_customer_from_file:
+                        income_df_with_customer.loc[idx, "customer_id"] = account_id_to_customer_from_file[account_id]
+                        matched_count += 1
+                if matched_count > 0:
+                    st.write(f"   ✅ Matched {matched_count} additional rows using AccountID fallback")
+            
+            # Use centralized helper function for AccountID + AccountName and AccountName-only matching
+            income_df_with_customer, name_matched_count = match_customer_id_by_name_fallback(
+                income_df_with_customer,
+                account_id_name_to_customer_from_file,
+                account_name_to_customer_from_file,
+                account_id_col="CustomerNumber",
+                account_name_col="AccountName",
+                extract_account_id_func=extract_account_id_from_customer_number
+            )
+            if name_matched_count > 0:
+                st.write(f"   ✅ Matched {name_matched_count} additional rows using AccountName matching")
         # Then try account_to_customer_mapping from combined_internal (only if CustomerNumber column exists)
         if account_to_customer_mapping and "CustomerNumber" in income_df_with_customer.columns:
-            if "customer_id" not in income_df_with_customer.columns:
-                income_df_with_customer["customer_id"] = None
             income_account_ids_for_mapping = income_df_with_customer["CustomerNumber"].apply(extract_account_id_from_customer_number)
             income_df_with_customer["customer_id"] = income_df_with_customer["customer_id"].fillna(
                 income_account_ids_for_mapping.map(account_to_customer_mapping)
             )
-        if "customer_id" not in income_df_with_customer.columns:
-                income_df_with_customer["customer_id"] = None
     
     # Map customer_id to LBPA file using CustomerNumber column - prefer Customer Number column from customer file
     if "CustomerNumber" in lbpa_df_with_customer.columns:
@@ -2564,83 +2588,38 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
                 mapped = unmapped_account_ids.map(account_id_to_customer_from_file)
                 lbpa_df_with_customer.loc[unmapped_mask, "customer_id"] = mapped
             
-            # For unmapped AccountIDs, try AccountID + AccountName matching
-            # This handles the case where a customer (like Finastra) has multiple AccountIDs, each with a different AccountName
-            unmapped_mask = lbpa_df_with_customer["customer_id"].isna() & lbpa_df_with_customer["CustomerNumber"].notna()
-            if unmapped_mask.any():
-                unmapped_rows = lbpa_df_with_customer[unmapped_mask].copy()
-                
-                # First try AccountID + AccountName matching (if available)
-                if account_id_name_to_customer_from_file and "AccountName" in lbpa_df_with_customer.columns:
-                    for idx, row in unmapped_rows.iterrows():
-                        account_id_raw = row["CustomerNumber"]
-                        account_id = re.sub(r"[^0-9]", "", str(account_id_raw)) if pd.notna(account_id_raw) else ""
-                        account_name = str(row.get("AccountName", "")).strip()
-                        
-                        if account_id and account_name:
-                            # Normalize name for matching
-                            normalized_name = re.sub(r"[^a-z0-9]", "", account_name.lower())
-                            # Try to find match using AccountID + AccountName
-                            if (account_id, normalized_name) in account_id_name_to_customer_from_file:
-                                lbpa_df_with_customer.loc[idx, "customer_id"] = account_id_name_to_customer_from_file[(account_id, normalized_name)]
-                
-                # Fallback: If AccountID exists in customer file but AccountName doesn't match,
-                # still use the customer_id (for cases where same customer has multiple AccountIDs)
-                # This handles Finastra case where AccountID might match but AccountName format differs
-                still_unmapped_mask = lbpa_df_with_customer["customer_id"].isna() & lbpa_df_with_customer["CustomerNumber"].notna()
-                if still_unmapped_mask.any() and account_id_to_customer_from_file:
-                    still_unmapped = lbpa_df_with_customer[still_unmapped_mask].copy()
-                    matched_count = 0
-                    for idx, row in still_unmapped.iterrows():
-                        account_id = extract_account_id_from_customer_number(row["CustomerNumber"])
-                        # If AccountID exists in customer file, use it (even if AccountName doesn't match)
-                        if account_id and account_id in account_id_to_customer_from_file:
-                            lbpa_df_with_customer.loc[idx, "customer_id"] = account_id_to_customer_from_file[account_id]
-                            matched_count += 1
-                    if matched_count > 0:
-                        st.write(f"   ✅ Matched {matched_count} additional LBPA rows using AccountID fallback")
-                
-                # Final fallback: Match by AccountName if AccountID doesn't match
-                # This handles cases like Finastra where multiple AccountIDs map to same customer
-                still_unmapped_after = lbpa_df_with_customer[lbpa_df_with_customer["customer_id"].isna() & lbpa_df_with_customer["CustomerNumber"].notna()]
-                if len(still_unmapped_after) > 0 and account_name_to_customer_from_file and "AccountName" in lbpa_df_with_customer.columns:
-                    name_matched_count = 0
-                    for idx, row in still_unmapped_after.iterrows():
-                        account_name = str(row.get("AccountName", "")).strip()
-                        if account_name:
-                            # Try full normalized name first
-                            normalized_name = re.sub(r"[^a-z0-9]", "", account_name.lower())
-                            if normalized_name in account_name_to_customer_from_file:
-                                lbpa_df_with_customer.loc[idx, "customer_id"] = account_name_to_customer_from_file[normalized_name]
-                                name_matched_count += 1
-                            else:
-                                # Try base name (before " - " or similar separators)
-                                base_name = account_name.split(" - ")[0].split(" – ")[0].split("-")[0].strip()
-                                base_normalized = re.sub(r"[^a-z0-9]", "", base_name.lower())
-                                if base_normalized in account_name_to_customer_from_file:
-                                    lbpa_df_with_customer.loc[idx, "customer_id"] = account_name_to_customer_from_file[base_normalized]
-                                    name_matched_count += 1
-                    if name_matched_count > 0:
-                        st.write(f"   ✅ Matched {name_matched_count} additional LBPA rows using AccountName matching")
-                
-                # Hardcoded fallback: Match Finastra rows to Finastra customer_id from customer file
-                if finastra_customer_id_from_file:
-                    # Check both CustomerName and AccountName columns
-                    name_col = "CustomerName" if "CustomerName" in lbpa_df_with_customer.columns else "AccountName"
-                    if name_col in lbpa_df_with_customer.columns:
-                        finastra_mask = lbpa_df_with_customer[name_col].astype(str).str.contains("Finastra", case=False, na=False) & lbpa_df_with_customer["customer_id"].isna()
-                        finastra_count = finastra_mask.sum()
-                        if finastra_count > 0:
-                            lbpa_df_with_customer.loc[finastra_mask, "customer_id"] = finastra_customer_id_from_file
+            # Fallback: If AccountID exists in customer file but AccountName doesn't match,
+            # still use the customer_id (for cases where same customer has multiple AccountIDs)
+            # This handles Finastra case where AccountID might match but AccountName format differs
+            still_unmapped_mask = lbpa_df_with_customer["customer_id"].isna() & lbpa_df_with_customer["CustomerNumber"].notna()
+            if still_unmapped_mask.any() and account_id_to_customer_from_file:
+                still_unmapped = lbpa_df_with_customer[still_unmapped_mask].copy()
+                matched_count = 0
+                for idx, row in still_unmapped.iterrows():
+                    account_id = extract_account_id_from_customer_number(row["CustomerNumber"])
+                    # If AccountID exists in customer file, use it (even if AccountName doesn't match)
+                    if account_id and account_id in account_id_to_customer_from_file:
+                        lbpa_df_with_customer.loc[idx, "customer_id"] = account_id_to_customer_from_file[account_id]
+                        matched_count += 1
+                if matched_count > 0:
+                    st.write(f"   ✅ Matched {matched_count} additional LBPA rows using AccountID fallback")
+            
+            # Use centralized helper function for AccountID + AccountName and AccountName-only matching
+            lbpa_df_with_customer, name_matched_count = match_customer_id_by_name_fallback(
+                lbpa_df_with_customer,
+                account_id_name_to_customer_from_file,
+                account_name_to_customer_from_file,
+                account_id_col="CustomerNumber",
+                account_name_col="AccountName",
+                extract_account_id_func=extract_account_id_from_customer_number
+            )
+            if name_matched_count > 0:
+                st.write(f"   ✅ Matched {name_matched_count} additional LBPA rows using AccountName matching")
         # Then try account_to_customer_mapping from combined_internal
         if account_to_customer_mapping:
-            if "customer_id" not in lbpa_df_with_customer.columns:
-                lbpa_df_with_customer["customer_id"] = None
             lbpa_df_with_customer["customer_id"] = lbpa_df_with_customer["customer_id"].fillna(
                 lbpa_account_ids.map(account_to_customer_mapping)
             )
-        if "customer_id" not in lbpa_df_with_customer.columns:
-                lbpa_df_with_customer["customer_id"] = None
     
     # If customer_id still missing, try mapping by customer name using parent_to_id and account_name_to_customer_from_file
     if "CustomerName" in income_df_with_customer.columns:
@@ -2648,105 +2627,63 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
             income_df_with_customer["__join_key__"] = income_df_with_customer["CustomerName"].astype(str).str.lower().str.replace(r"[^a-z0-9]", "", regex=True)
             # Try parent_to_id first (from mappings file)
             name_mapped = income_df_with_customer["__join_key__"].map(parent_to_id)
-            if "customer_id" not in income_df_with_customer.columns:
-                income_df_with_customer["customer_id"] = name_mapped
-            else:
-                income_df_with_customer["customer_id"] = income_df_with_customer["customer_id"].fillna(name_mapped)
+            income_df_with_customer["customer_id"] = income_df_with_customer["customer_id"].fillna(name_mapped)
             
             # Also try account_name_to_customer_from_file (from customer file) as additional fallback
             if account_name_to_customer_from_file and income_df_with_customer["customer_id"].isna().any():
-                unmapped_mask = income_df_with_customer["customer_id"].isna()
-                unmapped_rows = income_df_with_customer[unmapped_mask]
-                
-                for idx, row in unmapped_rows.iterrows():
-                    customer_name = str(row.get("CustomerName", "")).strip()
-                    if customer_name:
-                        # Try full normalized name
-                        normalized_name = re.sub(r"[^a-z0-9]", "", customer_name.lower())
-                        if normalized_name in account_name_to_customer_from_file:
-                            income_df_with_customer.loc[idx, "customer_id"] = account_name_to_customer_from_file[normalized_name]
-                        else:
-                            # Try base name (before " - " or similar separators)
-                            base_name = customer_name.split(" - ")[0].split(" – ")[0].split("-")[0].strip()
-                            base_normalized = re.sub(r"[^a-z0-9]", "", base_name.lower())
-                            if base_normalized in account_name_to_customer_from_file:
-                                income_df_with_customer.loc[idx, "customer_id"] = account_name_to_customer_from_file[base_normalized]
+                # Use centralized helper function for CustomerName matching
+                income_df_with_customer, _ = match_customer_id_by_name_fallback(
+                    income_df_with_customer,
+                    {},  # No AccountID+Name mapping needed here
+                    account_name_to_customer_from_file,
+                    account_id_col="CustomerNumber",  # Not used but required
+                    account_name_col="CustomerName",
+                    extract_account_id_func=None
+                )
     
     if "CustomerName" in lbpa_df_with_customer.columns:
         if "customer_id" not in lbpa_df_with_customer.columns or lbpa_df_with_customer["customer_id"].isna().any():
             lbpa_df_with_customer["__join_key__"] = lbpa_df_with_customer["CustomerName"].astype(str).str.lower().str.replace(r"[^a-z0-9]", "", regex=True)
             # Try parent_to_id first (from mappings file)
             name_mapped = lbpa_df_with_customer["__join_key__"].map(parent_to_id)
-            if "customer_id" not in lbpa_df_with_customer.columns:
-                lbpa_df_with_customer["customer_id"] = name_mapped
-            else:
-                lbpa_df_with_customer["customer_id"] = lbpa_df_with_customer["customer_id"].fillna(name_mapped)
+            lbpa_df_with_customer["customer_id"] = lbpa_df_with_customer["customer_id"].fillna(name_mapped)
             
             # Also try account_name_to_customer_from_file (from customer file) as additional fallback
             if account_name_to_customer_from_file and lbpa_df_with_customer["customer_id"].isna().any():
-                unmapped_mask = lbpa_df_with_customer["customer_id"].isna()
-                unmapped_rows = lbpa_df_with_customer[unmapped_mask]
-                for idx, row in unmapped_rows.iterrows():
-                    customer_name = str(row.get("CustomerName", "")).strip()
-                    if customer_name:
-                        # Try full normalized name
-                        normalized_name = re.sub(r"[^a-z0-9]", "", customer_name.lower())
-                        if normalized_name in account_name_to_customer_from_file:
-                            lbpa_df_with_customer.loc[idx, "customer_id"] = account_name_to_customer_from_file[normalized_name]
-                        else:
-                            # Try base name (before " - " or similar separators)
-                            base_name = customer_name.split(" - ")[0].split(" – ")[0].split("-")[0].strip()
-                            base_normalized = re.sub(r"[^a-z0-9]", "", base_name.lower())
-                            if base_normalized in account_name_to_customer_from_file:
-                                lbpa_df_with_customer.loc[idx, "customer_id"] = account_name_to_customer_from_file[base_normalized]
+                # Use centralized helper function for CustomerName matching
+                lbpa_df_with_customer, _ = match_customer_id_by_name_fallback(
+                    lbpa_df_with_customer,
+                    {},  # No AccountID+Name mapping needed here
+                    account_name_to_customer_from_file,
+                    account_id_col="CustomerNumber",  # Not used but required
+                    account_name_col="CustomerName",
+                    extract_account_id_func=None
+                )
     
     # Also try matching by AccountName column if CustomerName didn't match
     if "AccountName" in income_df_with_customer.columns and account_name_to_customer_from_file:
         if "customer_id" not in income_df_with_customer.columns or income_df_with_customer["customer_id"].isna().any():
-            unmapped_mask = income_df_with_customer["customer_id"].isna()
-            unmapped_rows = income_df_with_customer[unmapped_mask]
-            for idx, row in unmapped_rows.iterrows():
-                account_name = str(row.get("AccountName", "")).strip()
-                if account_name:
-                    # Try full normalized name
-                    normalized_name = re.sub(r"[^a-z0-9]", "", account_name.lower())
-                    if normalized_name in account_name_to_customer_from_file:
-                        income_df_with_customer.loc[idx, "customer_id"] = account_name_to_customer_from_file[normalized_name]
-                    else:
-                        # Try base name (before " - " or similar separators)
-                        base_name = account_name.split(" - ")[0].split(" – ")[0].split("-")[0].strip()
-                        base_normalized = re.sub(r"[^a-z0-9]", "", base_name.lower())
-                        if base_normalized in account_name_to_customer_from_file:
-                            income_df_with_customer.loc[idx, "customer_id"] = account_name_to_customer_from_file[base_normalized]
+            # Use centralized helper function for AccountName matching
+            income_df_with_customer, _ = match_customer_id_by_name_fallback(
+                income_df_with_customer,
+                {},  # No AccountID+Name mapping needed here
+                account_name_to_customer_from_file,
+                account_id_col="CustomerNumber",  # Not used but required
+                account_name_col="AccountName",
+                extract_account_id_func=None
+            )
     
     if "AccountName" in lbpa_df_with_customer.columns and account_name_to_customer_from_file:
         if "customer_id" not in lbpa_df_with_customer.columns or lbpa_df_with_customer["customer_id"].isna().any():
-            unmapped_mask = lbpa_df_with_customer["customer_id"].isna()
-            unmapped_rows = lbpa_df_with_customer[unmapped_mask]
-            for idx, row in unmapped_rows.iterrows():
-                account_name = str(row.get("AccountName", "")).strip()
-                if account_name:
-                    # Try full normalized name
-                    normalized_name = re.sub(r"[^a-z0-9]", "", account_name.lower())
-                    if normalized_name in account_name_to_customer_from_file:
-                        lbpa_df_with_customer.loc[idx, "customer_id"] = account_name_to_customer_from_file[normalized_name]
-                    else:
-                        # Try base name (before " - " or similar separators)
-                        base_name = account_name.split(" - ")[0].split(" – ")[0].split("-")[0].strip()
-                        base_normalized = re.sub(r"[^a-z0-9]", "", base_name.lower())
-                        if base_normalized in account_name_to_customer_from_file:
-                            lbpa_df_with_customer.loc[idx, "customer_id"] = account_name_to_customer_from_file[base_normalized]
-    
-    # Convert customer_id to string and filter valid ones
-    if "customer_id" in income_df_with_customer.columns:
-        income_df_with_customer["customer_id"] = income_df_with_customer["customer_id"].astype(str)
-    else:
-        income_df_with_customer["customer_id"] = None
-    
-    if "customer_id" in lbpa_df_with_customer.columns:
-        lbpa_df_with_customer["customer_id"] = lbpa_df_with_customer["customer_id"].astype(str)
-    else:
-        lbpa_df_with_customer["customer_id"] = None
+            # Use centralized helper function for AccountName matching
+            lbpa_df_with_customer, _ = match_customer_id_by_name_fallback(
+                lbpa_df_with_customer,
+                {},  # No AccountID+Name mapping needed here
+                account_name_to_customer_from_file,
+                account_id_col="CustomerNumber",  # Not used but required
+                account_name_col="AccountName",
+                extract_account_id_func=None
+            )
     
     # Transfer customer_id from income_df_with_customer to income_upload (after all mapping is done)
     # Match by CustomerNumber (extracted as AccountID) to preserve customer_id mapping
@@ -2763,27 +2700,8 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
             if account_id and pd.notna(customer_id) and customer_id not in ["nan", "None", ""] and account_id not in account_to_customer:
                 account_to_customer[account_id] = customer_id
         
-        # Also apply Finastra hardcoded mapping if needed
-        if finastra_customer_id_from_file:
-            # Find all Finastra AccountIDs in income_df_with_customer and add them to mapping
-            name_col = "CustomerName" if "CustomerName" in income_df_with_customer.columns else "AccountName"
-            if name_col in income_df_with_customer.columns:
-                finastra_mask = income_df_with_customer[name_col].astype(str).str.contains("Finastra", case=False, na=False)
-                finastra_rows = income_df_with_customer[finastra_mask]
-                for idx, row in finastra_rows.iterrows():
-                    # Use CustomerNumber (not AccountID) since that's what we mapped with
-                    account_id = extract_account_id_from_customer_number(row["CustomerNumber"]) if pd.notna(row["CustomerNumber"]) else ""
-                    if account_id:
-                        account_to_customer[account_id] = finastra_customer_id_from_file
-        
         # Map customer_id to income_upload
         income_upload["customer_id"] = income_upload["account_id"].astype(str).map(account_to_customer)
-        
-        # Final fallback: if still missing and it's Finastra, apply directly
-        if finastra_customer_id_from_file and "CustomerName" in income_upload.columns:
-            finastra_mask = income_upload["CustomerName"].astype(str).str.contains("Finastra", case=False, na=False) & income_upload["customer_id"].isna()
-            if finastra_mask.any():
-                income_upload.loc[finastra_mask, "customer_id"] = finastra_customer_id_from_file
     elif "customer_id" in income_df_with_customer.columns:
         # Fallback: if no AccountID, try to match by index (assuming same order)
         if len(income_df_with_customer) == len(income_df):
@@ -2804,27 +2722,8 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
             if account_id and pd.notna(customer_id) and customer_id not in ["nan", "None", ""] and account_id not in account_to_customer:
                 account_to_customer[account_id] = customer_id
         
-        # Also apply Finastra hardcoded mapping if needed
-        if finastra_customer_id_from_file:
-            # Find all Finastra AccountIDs in lbpa_df_with_customer and add them to mapping
-            name_col = "CustomerName" if "CustomerName" in lbpa_df_with_customer.columns else "AccountName"
-            if name_col in lbpa_df_with_customer.columns:
-                finastra_mask = lbpa_df_with_customer[name_col].astype(str).str.contains("Finastra", case=False, na=False)
-                finastra_rows = lbpa_df_with_customer[finastra_mask]
-                for idx, row in finastra_rows.iterrows():
-                    # Use CustomerNumber (not AccountID) since that's what we mapped with
-                    account_id = extract_account_id_from_customer_number(row["CustomerNumber"]) if pd.notna(row["CustomerNumber"]) else ""
-                    if account_id:
-                        account_to_customer[account_id] = finastra_customer_id_from_file
-        
         # Map customer_id to lbpa_upload
         lbpa_upload["customer_id"] = lbpa_upload["account_id"].astype(str).map(account_to_customer)
-        
-        # Final fallback: if still missing and it's Finastra, apply directly
-        if finastra_customer_id_from_file and "CustomerName" in lbpa_upload.columns:
-            finastra_mask = lbpa_upload["CustomerName"].astype(str).str.contains("Finastra", case=False, na=False) & lbpa_upload["customer_id"].isna()
-            if finastra_mask.any():
-                lbpa_upload.loc[finastra_mask, "customer_id"] = finastra_customer_id_from_file
     elif "customer_id" in lbpa_df_with_customer.columns:
         # Fallback: if no AccountID, try to match by index (assuming same order)
         if len(lbpa_df_with_customer) == len(lbpa_df):
@@ -2926,59 +2825,6 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
     if customer_app_sums and valid_customer_mask.any():
         mapped_apps = combined_internal.loc[valid_customer_mask, "__group_key__"].map(customer_app_sums).fillna(0)
         combined_internal.loc[valid_customer_mask, "IsInitialSubmission"] = mapped_apps
-    
-    # For rows with missing customer_id, calculate sums by account_id instead
-    # Sum ALL rows from original Income and LBPA files by account_id (not just ones without customer_id)
-    missing_customer_mask = ~valid_customer_mask
-    if missing_customer_mask.any() and "account_id" in combined_internal.columns:
-        # Create account_id to sum mappings for missing customer_id rows
-        account_units_sums = {}
-        account_app_sums = {}
-        
-        # Sum from Income file by account_id (ALL rows, not filtered by customer_id)
-        if "UnitsAsPerSubmission" in income_df.columns and "AccountID" in income_df.columns:
-            income_account_groups = income_df["AccountID"].astype(str).str.replace(r"[^0-9]", "", regex=True)
-            income_df["UnitsAsPerSubmission"] = pd.to_numeric(income_df["UnitsAsPerSubmission"], errors="coerce").fillna(0)
-            income_units_by_account = income_df.groupby(income_account_groups)["UnitsAsPerSubmission"].sum()
-            for account_id, value in income_units_by_account.items():
-                if account_id:
-                    account_units_sums[account_id] = account_units_sums.get(account_id, 0) + value
-        
-        if "IsInitialSubmission" in income_df.columns and "AccountID" in income_df.columns:
-            income_account_groups = income_df["AccountID"].astype(str).str.replace(r"[^0-9]", "", regex=True)
-            income_df["IsInitialSubmission"] = pd.to_numeric(income_df["IsInitialSubmission"], errors="coerce").fillna(0)
-            income_apps_by_account = income_df.groupby(income_account_groups)["IsInitialSubmission"].sum()
-            for account_id, value in income_apps_by_account.items():
-                if account_id:
-                    account_app_sums[account_id] = account_app_sums.get(account_id, 0) + value
-        
-        # Sum from LBPA file by account_id (ALL rows, not filtered by customer_id)
-        if "UnitsAsPerSubmission" in lbpa_df.columns and "AccountID" in lbpa_df.columns:
-            lbpa_account_groups = lbpa_df["AccountID"].astype(str).str.replace(r"[^0-9]", "", regex=True)
-            lbpa_df["UnitsAsPerSubmission"] = pd.to_numeric(lbpa_df["UnitsAsPerSubmission"], errors="coerce").fillna(0)
-            lbpa_units_by_account = lbpa_df.groupby(lbpa_account_groups)["UnitsAsPerSubmission"].sum()
-            for account_id, value in lbpa_units_by_account.items():
-                if account_id:
-                    account_units_sums[account_id] = account_units_sums.get(account_id, 0) + value
-        
-        if "IsInitialSubmission" in lbpa_df.columns and "AccountID" in lbpa_df.columns:
-            lbpa_account_groups = lbpa_df["AccountID"].astype(str).str.replace(r"[^0-9]", "", regex=True)
-            lbpa_df["IsInitialSubmission"] = pd.to_numeric(lbpa_df["IsInitialSubmission"], errors="coerce").fillna(0)
-            lbpa_apps_by_account = lbpa_df.groupby(lbpa_account_groups)["IsInitialSubmission"].sum()
-            for account_id, value in lbpa_apps_by_account.items():
-                if account_id:
-                    account_app_sums[account_id] = account_app_sums.get(account_id, 0) + value
-        
-        # Map sums to rows with missing customer_id using account_id
-        if account_units_sums:
-            missing_account_ids = combined_internal.loc[missing_customer_mask, "account_id"].astype(str).str.replace(r"[^0-9]", "", regex=True)
-            mapped_units = missing_account_ids.map(account_units_sums).fillna(0)
-            combined_internal.loc[missing_customer_mask, "UnitsAsPerSubmission"] = mapped_units.values
-        
-        if account_app_sums:
-            missing_account_ids = combined_internal.loc[missing_customer_mask, "account_id"].astype(str).str.replace(r"[^0-9]", "", regex=True)
-            mapped_apps = missing_account_ids.map(account_app_sums).fillna(0)
-            combined_internal.loc[missing_customer_mask, "IsInitialSubmission"] = mapped_apps.values
     
     # Update value column based on event_type_name:
     # - If event_type_name contains "unit" → value = UnitsAsPerSubmission
@@ -3284,12 +3130,7 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
     # Generating usage file...
     # Separate unmapped rows (customer_id is missing AND CustomerName is still numeric/account ID)
     # Use the same logic as valid_customer_mask to identify invalid customer_ids
-    customer_id_missing = (
-        combined_internal["customer_id"].isna() |
-        (combined_internal["customer_id"].astype(str).str.strip() == "") |
-        (combined_internal["customer_id"].astype(str).str.strip().str.lower() == "nan") |
-        (combined_internal["customer_id"].astype(str).str.strip() == "None")
-    )
+    customer_id_missing = combined_internal["customer_id"].isna()
     customer_name_is_numeric = combined_internal["CustomerName"].astype(str).str.match(r'^\d+$', na=False)
     unmapped_mask = customer_id_missing & customer_name_is_numeric
     
@@ -3309,13 +3150,8 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
         combined_message = "✅ " + ", ".join(message_parts)
         st.success(combined_message)
     
-    # Also check for rows with invalid customer_id (not just missing, but also "nan", "None", empty)
-    invalid_customer_mask = (
-        combined_internal["customer_id"].isna() |
-        (combined_internal["customer_id"].astype(str).str.strip() == "") |
-        (combined_internal["customer_id"].astype(str).str.strip().str.lower() == "nan") |
-        (combined_internal["customer_id"].astype(str).str.strip() == "None")
-    )
+    # Also check for rows with invalid customer_id (missing)
+    invalid_customer_mask = combined_internal["customer_id"].isna()
     
     # Clear event_type_name for rows without customer_id (can't be validated against API)
     combined_internal.loc[customer_id_missing, "event_type_name"] = ""
@@ -3602,9 +3438,6 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
         if "customer_id" in income_df_with_customer.columns:
             income_valid = income_df_with_customer[
                 income_df_with_customer["customer_id"].notna() &
-                (income_df_with_customer["customer_id"].astype(str).str.strip() != "") &
-                (income_df_with_customer["customer_id"].astype(str).str.strip().str.lower() != "nan") &
-                (income_df_with_customer["customer_id"].astype(str).str.strip() != "None") &
                 income_df_with_customer["AccountID"].notna()
             ]
             
@@ -3639,10 +3472,7 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
         # Also collect AccountIDs that don't have customer_id (for entityId lookup)
         if "customer_id" in income_df_with_customer.columns:
             income_missing = income_df_with_customer[
-                (income_df_with_customer["customer_id"].isna() |
-                 (income_df_with_customer["customer_id"].astype(str).str.strip() == "") |
-                 (income_df_with_customer["customer_id"].astype(str).str.strip().str.lower() == "nan") |
-                 (income_df_with_customer["customer_id"].astype(str).str.strip() == "None")) &
+                income_df_with_customer["customer_id"].isna() &
                 income_df_with_customer["AccountID"].notna()
             ]
             for _, row in income_missing.iterrows():
@@ -3655,9 +3485,6 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
         if "customer_id" in lbpa_df_with_customer.columns:
             lbpa_valid = lbpa_df_with_customer[
                 lbpa_df_with_customer["customer_id"].notna() &
-                (lbpa_df_with_customer["customer_id"].astype(str).str.strip() != "") &
-                (lbpa_df_with_customer["customer_id"].astype(str).str.strip().str.lower() != "nan") &
-                (lbpa_df_with_customer["customer_id"].astype(str).str.strip() != "None") &
                 lbpa_df_with_customer["AccountID"].notna()
             ]
             
@@ -3686,10 +3513,7 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
         # Also collect AccountIDs that don't have customer_id (for entityId lookup)
         if "customer_id" in lbpa_df_with_customer.columns:
             lbpa_missing = lbpa_df_with_customer[
-                (lbpa_df_with_customer["customer_id"].isna() |
-                 (lbpa_df_with_customer["customer_id"].astype(str).str.strip() == "") |
-                 (lbpa_df_with_customer["customer_id"].astype(str).str.strip().str.lower() == "nan") |
-                 (lbpa_df_with_customer["customer_id"].astype(str).str.strip() == "None")) &
+                lbpa_df_with_customer["customer_id"].isna() &
                 lbpa_df_with_customer["AccountID"].notna()
             ]
             for _, row in lbpa_missing.iterrows():
@@ -3766,168 +3590,6 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
     # These mappings are built by matching AccountIDs in income/LBPA files to customer IDs
     
     # Handle customers in income/LBPA files that don't have AccountID set in customer file
-    # These customers are already in the customer file but their "Customer Number" column is empty
-    # Find them by name in TABS (only "- NMS" customers) and set their AccountID
-    # Only set AccountID if customer doesn't already have it in customer file
-    # DISABLED: Not using TABS customer search API
-    if False and get_api_key() and account_ids_without_customer_id:
-        st.write(f"🔍 Searching TABS for {len(account_ids_without_customer_id)} AccountIDs that couldn't be mapped...")
-        
-        # Build name to AccountID mapping from unmapped rows
-        name_to_accountid_unmapped = {}
-        
-        # Collect from income file
-        if "AccountID" in income_df_with_customer.columns:
-            income_unmapped = income_df_with_customer[
-                (income_df_with_customer["customer_id"].isna() |
-                 (income_df_with_customer["customer_id"].astype(str).str.strip() == "") |
-                 (income_df_with_customer["customer_id"].astype(str).str.strip().str.lower() == "nan") |
-                 (income_df_with_customer["customer_id"].astype(str).str.strip() == "None")) &
-                income_df_with_customer["AccountID"].notna()
-            ]
-            
-            name_col_income = "CustomerName" if "CustomerName" in income_unmapped.columns else "AccountName"
-            if name_col_income in income_unmapped.columns:
-                for _, row in income_unmapped.iterrows():
-                    account_id_raw = row.get("AccountID")
-                    account_name = str(row.get(name_col_income, "")).strip()
-                    if account_id_raw and account_name:
-                        account_id = re.sub(r"[^0-9]", "", str(account_id_raw))
-                        if account_id and account_id in account_ids_without_customer_id:
-                            normalized_name = re.sub(r"[^a-z0-9]", "", account_name.lower())
-                            # Store the first AccountID we find for this name
-                            if normalized_name not in name_to_accountid_unmapped:
-                                name_to_accountid_unmapped[normalized_name] = account_id
-        
-        # Collect from LBPA file
-        if "AccountID" in lbpa_df_with_customer.columns:
-            lbpa_unmapped = lbpa_df_with_customer[
-                (lbpa_df_with_customer["customer_id"].isna() |
-                 (lbpa_df_with_customer["customer_id"].astype(str).str.strip() == "") |
-                 (lbpa_df_with_customer["customer_id"].astype(str).str.strip().str.lower() == "nan") |
-                 (lbpa_df_with_customer["customer_id"].astype(str).str.strip() == "None")) &
-                lbpa_df_with_customer["AccountID"].notna()
-            ]
-            
-            name_col_lbpa = "CustomerName" if "CustomerName" in lbpa_unmapped.columns else "AccountName"
-            if name_col_lbpa in lbpa_unmapped.columns:
-                for _, row in lbpa_unmapped.iterrows():
-                    account_id_raw = row.get("AccountID")
-                    account_name = str(row.get(name_col_lbpa, "")).strip()
-                    if account_id_raw and account_name:
-                        account_id = re.sub(r"[^0-9]", "", str(account_id_raw))
-                        if account_id and account_id in account_ids_without_customer_id:
-                            normalized_name = re.sub(r"[^a-z0-9]", "", account_name.lower())
-                            # Store the first AccountID we find for this name (don't overwrite if already exists)
-                            if normalized_name not in name_to_accountid_unmapped:
-                                name_to_accountid_unmapped[normalized_name] = account_id
-        
-        # Search TABS for customers with matching names (only "- NMS" customers) and set AccountID
-        if name_to_accountid_unmapped:
-            api_key = get_api_key()
-            headers = {
-                "Authorization": f"{api_key}",
-                "Content-Type": "application/json"
-            }
-            
-            try:
-                import urllib3
-                urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-                
-                found_count = 0
-                updated_count = 0
-                new_customers_list = []
-                
-                # Fetch customers from TABS (only need to check names, so we can search)
-                url = f"{API_URL_BASE}"
-                page = 1
-                limit = 100
-                total_processed = 0
-                
-                st.write(f"   📡 Fetching customers from TABS API (searching for matching names)...")
-                while True:
-                    params = {"page": page, "limit": limit}
-                    res = requests.get(url, headers=headers, params=params, timeout=30, verify=False)
-                    
-                    if res.status_code != 200:
-                        break
-                    
-                    data = res.json()
-                    payload = data.get("payload", {})
-                    customers = payload.get("data", [])
-                    
-                    if not customers:
-                        break
-                    
-                    # Check each customer
-                    for customer in customers:
-                        customer_id = str(customer.get("id", "")).strip()
-                        customer_name = str(customer.get("name", "")).strip()
-                        
-                        # Only process customers with "- NMS" in their name
-                        if not customer_id or not customer_name or "- NMS" not in customer_name:
-                            continue
-                        
-                        # Try to match by normalized name
-                        normalized_customer_name = re.sub(r"[^a-z0-9]", "", customer_name.lower())
-                        
-                        if normalized_customer_name in name_to_accountid_unmapped:
-                            account_id = name_to_accountid_unmapped[normalized_customer_name]
-                            
-                            # Only set if customer doesn't already have AccountID in customer file
-                            if customer_id not in customers_with_accountid_in_file:
-                                found_count += 1
-                                
-                                # Set the AccountID custom field
-                                if update_customer_custom_field(customer_id, CUSTOMER_NUMBER_FIELD_ID, account_id):
-                                    updated_count += 1
-                                    new_customers_list.append((customer_name, account_id))
-                            
-                            # Remove from unmapped list since we found it (whether we set it or not)
-                            account_ids_without_customer_id.discard(account_id)
-                        else:
-                            # Try base name matching (before " - " or similar)
-                            base_name = customer_name.split(" - ")[0].split(" – ")[0].split("-")[0].strip()
-                            base_normalized = re.sub(r"[^a-z0-9]", "", base_name.lower())
-                            if base_normalized in name_to_accountid_unmapped:
-                                account_id = name_to_accountid_unmapped[base_normalized]
-                                
-                                # Only set if customer doesn't already have AccountID in customer file
-                                if customer_id not in customers_with_accountid_in_file:
-                                    found_count += 1
-                                    
-                                    # Set the AccountID custom field
-                                    if update_customer_custom_field(customer_id, CUSTOMER_NUMBER_FIELD_ID, account_id):
-                                        updated_count += 1
-                                        new_customers_list.append((customer_name, account_id))
-                                
-                                # Remove from unmapped list since we found it (whether we set it or not)
-                                account_ids_without_customer_id.discard(account_id)
-                    
-                    # Check if there are more pages
-                    total_items = payload.get("totalItems", 0)
-                    current_page = payload.get("currentPage", page)
-                    if (current_page + 1) * limit >= total_items:
-                        break
-                    
-                    page += 1
-                    total_processed += len(customers)
-                    
-                    # Show progress every 10 pages
-                    if page % 10 == 0:
-                        st.write(f"   ⏳ Processed {total_processed:,} customers, found {found_count} matches, {len(account_ids_without_customer_id)} remaining...")
-                    
-                    # Stop early if we found all AccountIDs
-                    if not account_ids_without_customer_id:
-                        break
-                
-                if found_count > 0:
-                    st.write(f"✅ Found {found_count} customers in TABS and set AccountIDs for {updated_count} customers")
-                    if new_customers_list:
-                        st.write(f"   Customers: {', '.join([f'{name} (AccountID: {acct})' for name, acct in new_customers_list])}")
-            except Exception as e:
-                st.write(f"⚠️ Error finding new customers: {str(e)}")
-    
     return income_upload, lbpa_df, combined_csv_bytes, combined_internal_csv_bytes
 
 
@@ -3947,9 +3609,8 @@ def generate_split_csvs_with_all_columns(income_df, lbpa_df, usage_df):
     elif "AccountName" in usage_df.columns:
         usage_name_col = "AccountName"
     
-    # Get mappings from usage_df - try account_id first, then CustomerName
+    # Get mappings from usage_df - account_id → customer_id only
     account_id_to_customer_id = {}
-    customername_to_customer_id = {}
     # Also create reverse mapping: customer_id -> CustomerName (for filename)
     customer_id_to_name = {}
     
@@ -3960,54 +3621,24 @@ def generate_split_csvs_with_all_columns(income_df, lbpa_df, usage_df):
         account_id_to_customer_id = dict(zip(usage_acct_mapping["__acct_key__"], usage_acct_mapping["customer_id"]))
     
     if usage_name_col and "customer_id" in usage_df.columns:
+        # Reverse mapping for filename generation only (not for matching)
         usage_mapping = usage_df[[usage_name_col, "customer_id"]].drop_duplicates()
-        # Create both exact and normalized name mappings
-        for name, cust_id in zip(usage_mapping[usage_name_col].astype(str), usage_mapping["customer_id"]):
-            customername_to_customer_id[name] = cust_id
-            # Also create normalized version for matching
-            normalized_name = normalize_name(name)
-            if normalized_name not in customername_to_customer_id:
-                customername_to_customer_id[normalized_name] = cust_id
-        # Reverse mapping for filename generation
         customer_id_to_name = dict(zip(usage_mapping["customer_id"].astype(str), usage_mapping[usage_name_col].astype(str)))
     
     def add_customer_id_from_usage(df, df_name):
-        """Add customer_id to dataframe by joining with usage_df mapping"""
+        """Add customer_id to dataframe by joining with usage_df mapping via account_id only.
+        This function does not create new customer mappings - it only uses account_id → customer_id from usage_df."""
         df = df.copy()
         df.columns = df.columns.str.strip()
         
-        # Find AccountName/CustomerName column in original Income/LBPA file
-        parent_col = find_column(df, ["customername", "accountname", "name"])
+        # Find account_id column in original Income/LBPA file
         acct_id_col = find_column(df, ["accountid", "acct#", "acct", "account number", "accountnumber"])
         
-        if parent_col:
-            df["__original_name__"] = df[parent_col].astype(str)
-            df["__original_name__"] = df["__original_name__"].fillna("Unknown")
-        else:
-            df["__original_name__"] = "Unknown"
-        
-        # Try account_id matching first (most reliable, like reference code)
+        # Only use account_id matching (usage_df is the single source of truth)
         if acct_id_col and account_id_to_customer_id:
             df["__acct_key__"] = df[acct_id_col].astype(str).str.replace(r"[^0-9]", "", regex=True)
             df["customer_id"] = df["__acct_key__"].map(account_id_to_customer_id)
-        
-        # Fill missing with name-based matching (try exact first, then normalized)
-        if customername_to_customer_id:
-            # Try exact match first
-            name_mapped = df["__original_name__"].map(customername_to_customer_id)
-            if "customer_id" in df.columns:
-                df["customer_id"] = df["customer_id"].fillna(name_mapped)
-            else:
-                df["customer_id"] = name_mapped
-            
-            # If still missing, try normalized name matching
-            missing_mask = df["customer_id"].isna()
-            if missing_mask.any():
-                df.loc[missing_mask, "__normalized_name__"] = df.loc[missing_mask, "__original_name__"].apply(normalize_name)
-                normalized_mapped = df.loc[missing_mask, "__normalized_name__"].map(customername_to_customer_id)
-                df.loc[missing_mask, "customer_id"] = df.loc[missing_mask, "customer_id"].fillna(normalized_mapped)
-        
-        if "customer_id" not in df.columns:
+        else:
             df["customer_id"] = None
         
         return df

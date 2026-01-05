@@ -2283,9 +2283,13 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
             # For common keys, remove from units (keep the "app" row)
             income_upload_units_filtered = income_upload_units_filtered[~income_upload_units_filtered["__match_key__"].isin(common_keys)]
         
-        # Remove the temporary key column
-        income_upload_apps_filtered = income_upload_apps_filtered.drop(columns=["__match_key__"], errors="ignore")
-        income_upload_units_filtered = income_upload_units_filtered.drop(columns=["__match_key__"], errors="ignore")
+        # Remove helper columns (all columns starting with "__")
+        helper_cols_apps = [col for col in income_upload_apps_filtered.columns if col.startswith("__")]
+        helper_cols_units = [col for col in income_upload_units_filtered.columns if col.startswith("__")]
+        if helper_cols_apps:
+            income_upload_apps_filtered = income_upload_apps_filtered.drop(columns=helper_cols_apps, errors="ignore")
+        if helper_cols_units:
+            income_upload_units_filtered = income_upload_units_filtered.drop(columns=helper_cols_units, errors="ignore")
     
     # Concatenate Income apps and units (only rows with values > 0, duplicates removed)
     income_upload = pd.concat([income_upload_apps_filtered, income_upload_units_filtered], ignore_index=True)
@@ -4020,8 +4024,8 @@ def generate_split_csvs_with_all_columns(income_df, lbpa_df, usage_df):
     if len(combined_all) == 0:
         return results
     
-    # Remove helper columns before generating CSVs (keep only original columns + customer_id)
-    helper_columns = ["__original_name__", "__acct_key__", "__normalized_name__", "__join_key__", "__original_account_name__"]
+    # Remove helper columns before generating CSVs (drop all columns starting with "__")
+    helper_columns = [col for col in combined_all.columns if col.startswith("__")]
     columns_to_keep = [col for col in combined_all.columns if col not in helper_columns]
     # Ensure customer_id is included
     if "customer_id" not in columns_to_keep:
@@ -4370,8 +4374,8 @@ with chunk_tab:
                     lbpa_df = pd.read_csv(BytesIO(uploaded_files_check["lbpa"]["bytes"]))
                     
                     # Show download buttons if split CSVs already exist
-                    if st.session_state.get("split_csvs_ready") and st.session_state.get("invoice_split_csvs"):
-                        split_csvs = st.session_state["invoice_split_csvs"]
+                    if st.session_state.get("split_csvs_ready"):
+                        split_csvs = st.session_state.get("invoice_split_csvs", [])
                         col_header1, col_header2 = st.columns([3, 1])
                         with col_header1:
                             st.success(f"✅ {len(split_csvs)} split CSV files ready")
@@ -4659,1050 +4663,143 @@ with chunk_tab:
             
             st.markdown("---")
             
-            # Invoice issue date selector
-            issue_date = st.date_input(
-                "Select Invoice Issue Date",
-                value=datetime.now().date(),
-                help="Select the issue date for the invoices you want to map to"
-            )
-            
-            if st.button("Map Invoices to Split CSVs", type="primary"):
-                if not api_key_attach:
-                    st.error("⚠️ Please enter API key first")
-                else:
-                    split_csvs = st.session_state.get("invoice_split_csvs", [])
-                    if not split_csvs:
-                        st.error("⚠️ No split CSVs found. Please complete Step 1 first.")
-                    else:
-                        with st.spinner("Mapping invoices..."):
-                            mapping_results = []
-                            
-                            for split_csv in split_csvs:
-                                csv_df = pd.read_csv(BytesIO(split_csv["bytes"]))
-                                customer_id = None
-                                
-                                # Try to get customer_id from the CSV
-                                if "customer_id" in csv_df.columns:
-                                    customer_ids = csv_df["customer_id"].dropna().unique()
-                                    if len(customer_ids) > 0:
-                                        customer_id = str(customer_ids[0]).strip()
-                                
-                                if not customer_id or customer_id == "nan":
-                                    mapping_results.append({
-                                        "split_csv_filename": split_csv["name"],
-                                        "customer_id": "N/A",
-                                        "invoice_id": "Not Found",
-                                        "status": "Failed",
-                                        "reason": "No customer ID in CSV"
-                                    })
-                                    continue
-                                
-                                # Look up invoice for this customer
-                                invoice_id = find_invoice_by_date(customer_id, issue_date, api_key_attach)
-                                
-                                if invoice_id:
-                                    mapping_results.append({
-                                        "split_csv_filename": split_csv["name"],
-                                        "customer_id": customer_id,
-                                        "invoice_id": invoice_id,
-                                        "status": "Success"
-                                    })
-                                else:
-                                    mapping_results.append({
-                                        "split_csv_filename": split_csv["name"],
-                                        "customer_id": customer_id,
-                                        "invoice_id": "Not Found",
-                                        "status": "Failed",
-                                        "reason": "No matching invoice found"
-                                    })
-                            
-                            mapping_df = pd.DataFrame(mapping_results)
-                            st.session_state["invoice_mapping"] = mapping_df
-                            st.session_state["invoice_mapping_ready"] = True
-                            
-                            # Show results
-                            success_count = (mapping_df["status"] == "Success").sum()
-                            st.success(f"✅ Mapped {success_count}/{len(mapping_df)} split CSVs to invoices")
-                            
-                            # Show successful mappings
-                            successful_mappings = mapping_df[mapping_df["status"] == "Success"]
-                            if len(successful_mappings) > 0:
-                                st.dataframe(successful_mappings[["split_csv_filename", "customer_id", "invoice_id"]], use_container_width=True)
-                            
-                            # Show unmapped files
-                            unmapped = mapping_df[mapping_df["status"] == "Failed"]
-                            if len(unmapped) > 0:
-                                st.warning(f"⚠️ {len(unmapped)} Split CSVs Requiring Attention")
-                                st.dataframe(unmapped, use_container_width=True)
-    
-    elif current_step == 2:  # Step 3: Bulk Upload
-        st.subheader("Bulk Upload CSV Attachments")
-        
-        st.info("Upload all mapped CSV files as attachments to their corresponding invoices.")
-        
-        # Check if mapping is ready
-        mapping_ready = False
-        mapping_df = None
-        
-        # Option to upload mapping CSV (takes priority over generated mapping)
-        uploaded_mapping = st.file_uploader("Upload Invoice Mapping CSV (optional)", type=["csv"], key="upload_mapping_csv")
-        
-        if uploaded_mapping is not None:
-            # User uploaded a CSV - use it instead of the generated mapping
-            try:
-                mapping_df = pd.read_csv(uploaded_mapping)
-                required_cols = ["split_csv_filename", "customer_id", "invoice_id"]
-                if all(col in mapping_df.columns for col in required_cols):
-                    mapping_ready = True
-                    st.success(f"✅ Loaded {len(mapping_df)} mappings from uploaded CSV (overriding generated mapping)")
-                    st.dataframe(mapping_df, use_container_width=True)
-                else:
-                    st.error(f"CSV must have columns: {', '.join(required_cols)}")
-                    mapping_ready = False
-            except Exception as e:
-                st.error(f"Error reading CSV: {str(e)}")
-                mapping_ready = False
-        else:
-            # No file uploaded - use generated mapping from Step 2
-            if not st.session_state.get("invoice_mapping_ready"):
-                st.warning("⚠️ Please complete Step 2 first (Invoice Mapping) or upload a CSV mapping file")
-                mapping_ready = False
-            else:
-                mapping_df = st.session_state.get("invoice_mapping")
-                mapping_ready = True
-        
-        if mapping_ready and mapping_df is not None:
-            split_csvs = st.session_state.get("invoice_split_csvs", [])
-            
-            if not split_csvs:
-                st.warning("⚠️ Split CSVs not found. Please complete Step 1 first (Generate Split CSVs)")
-            else:
-                # Filter to only include successful mappings (status == "Success" and invoice_id != "Not Found")
-                successful_mappings = mapping_df[
-                    (mapping_df["status"] == "Success") & 
-                    (mapping_df["invoice_id"] != "Not Found") &
-                    (mapping_df["invoice_id"].notna())
-                ].copy()
-                
-                failed_count = len(mapping_df) - len(successful_mappings)
-                if failed_count > 0:
-                    st.warning(f"⚠️ {failed_count} split CSV(s) were not mapped to invoices and will be excluded from upload")
-                
-                st.info(f"📋 Ready to upload {len(successful_mappings)} split CSVs to invoices")
-                
-                # Create lookup dict for split CSVs
-                split_csvs_dict = {split_csv["name"]: split_csv for split_csv in split_csvs}
-            
-                # Show preview (only successful mappings)
-                st.subheader("Upload Preview")
-                preview_df = successful_mappings.copy()
-                preview_df["split_csv_size"] = preview_df["split_csv_filename"].map(
-                    lambda x: len(pd.read_csv(BytesIO(split_csvs_dict[x]["bytes"]))) if x in split_csvs_dict else 0
-                )
-                preview_df["split_csv_exists"] = preview_df["split_csv_filename"].map(
-                    lambda x: "Yes" if x in split_csvs_dict else "No"
-                )
-                st.dataframe(preview_df, use_container_width=True)
-                
-                # Check for missing split CSVs
-                missing_csvs = preview_df[preview_df["split_csv_exists"] == "No"]["split_csv_filename"].tolist()
-                if missing_csvs:
-                    st.warning(f"⚠️ {len(missing_csvs)} split CSV(s) not found: {', '.join(missing_csvs[:5])}{'...' if len(missing_csvs) > 5 else ''}")
-                
-                api_key = st.session_state.get('invoice_api_key', '')
-                
-                if not api_key:
-                    st.warning("⚠️ Please enter API key in Step 2")
-                else:
-                    # Add test mode option
-                    test_mode = st.checkbox("🧪 Test Mode: Upload only one row from the first split CSV", value=False)
-                    
-                    if st.button("Start Bulk Upload", type="primary"):
-                        try:
-                            with st.spinner("Uploading CSV attachments..."):
-                                upload_results = []
-                                progress_bar = st.progress(0)
-                                
-                                # Limit to first row if test mode is enabled (only use successful mappings)
-                                rows_to_process = successful_mappings.head(1) if test_mode else successful_mappings
-                                
-                                for idx, row in rows_to_process.iterrows():
-                                    split_csv_name = row["split_csv_filename"]
-                                    customer_id = row["customer_id"]
-                                    invoice_id = row["invoice_id"]
-                                    
-                                    if split_csv_name not in split_csvs_dict:
-                                        upload_results.append({
-                                            "split_csv": split_csv_name,
-                                            "status": "Failed",
-                                            "reason": "Split CSV not found"
-                                        })
-                                        continue
-                                    
-                                    split_csv_bytes = split_csvs_dict[split_csv_name]["bytes"]
-                                    
-                                    # In test mode, create a CSV with only the first row
-                                    if test_mode:
-                                        try:
-                                            test_df = pd.read_csv(BytesIO(split_csv_bytes))
-                                            if len(test_df) > 0:
-                                                # Keep only the first row
-                                                test_df = test_df.head(1)
-                                                # Create new filename with "_test" suffix
-                                                test_filename = split_csv_name.replace(".csv", "_test.csv")
-                                                split_csv_bytes = test_df.to_csv(index=False).encode("utf-8")
-                                                split_csv_name = test_filename
-                                            else:
-                                                upload_results.append({
-                                                    "split_csv": split_csv_name,
-                                                    "status": "Failed",
-                                                    "reason": "CSV is empty"
-                                                })
-                                                continue
-                                        except Exception as e:
-                                            upload_results.append({
-                                                "split_csv": split_csv_name,
-                                                "status": "Failed",
-                                                "reason": f"Error reading CSV: {str(e)}"
-                                            })
-                                            continue
-                                    
-                                    # Upload CSV as attachment to invoice
-                                    success = upload_csv_attachment(
-                                        customer_id,
-                                        invoice_id,
-                                        split_csv_bytes,
-                                        split_csv_name,
-                                        api_key
-                                    )
-                                    
-                                    upload_results.append({
-                                        "split_csv": split_csv_name,
-                                        "customer_id": customer_id,
-                                        "invoice_id": invoice_id,
-                                        "status": "Success" if success else "Failed",
-                                        "reason": "" if success else "Upload failed"
-                                    })
-                                    
-                                    progress_bar.progress((idx + 1) / len(rows_to_process))
-                                
-                                results_df = pd.DataFrame(upload_results)
-                                st.session_state["upload_results"] = results_df
-                                
-                                success_count = (results_df["status"] == "Success").sum()
-                                progress_bar.empty()
-                                
-                                if test_mode:
-                                    st.success(f"✅ Test upload complete! {success_count}/{len(results_df)} successful")
-                                else:
-                                    st.success(f"✅ Upload complete! {success_count}/{len(results_df)} successful")
-                                
-                        except Exception as e:
-                            st.error(f"Error during bulk upload: {str(e)}")
-                            import traceback
-                            st.code(traceback.format_exc())
-                        with st.spinner("Generating split CSVs..."):
-                            split_csvs = generate_split_csvs_with_all_columns(income_df, lbpa_df, usage_df)
-                            
-                            if split_csvs:
-                                st.session_state["invoice_split_csvs"] = split_csvs
-                                st.session_state["split_csvs_ready"] = True
-                                
-                                # Show summary
-                                summary_data = []
-                                for split_csv in split_csvs:
-                                    csv_df = pd.read_csv(BytesIO(split_csv["bytes"]))
-                                    summary_data.append({
-                                        "Filename": split_csv["name"],
-                                        "Rows": len(csv_df),
-                                        "Customer ID": csv_df["customer_id"].iloc[0] if "customer_id" in csv_df.columns and len(csv_df) > 0 else "N/A"
-                                    })
-                                
-                                summary_df = pd.DataFrame(summary_data)
-                                st.success(f"✅ Generated {len(split_csvs)} split CSV files")
-                                st.dataframe(summary_df, use_container_width=True)
-                                
-                                # Add search and download all functionality
-                                st.markdown("---")
-                                col1, col2 = st.columns([3, 1])
-                                with col1:
-                                    search_term_new = st.text_input("Search split CSVs by filename or customer ID", 
-                                                                   placeholder="Type to filter...", 
-                                                                   key="search_split_csvs_new",
-                                                                   label_visibility="visible")
-                                with col2:
-                                    # Download all as ZIP
-                                    import zipfile
-                                    zip_buffer = BytesIO()
-                                    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-                                        for split_csv in split_csvs:
-                                            zip_file.writestr(split_csv["name"], split_csv["bytes"])
-                                    zip_buffer.seek(0)
-                                    st.write("")  # Add spacing to align with input field
-                                    st.download_button(
-                                        "Download All as ZIP",
-                                        data=zip_buffer.getvalue(),
-                                        file_name="all_split_csvs.zip",
-                                        mime="application/zip",
-                                        key="dl_all_split_csvs_zip_new",
-                                        use_container_width=True
-                                    )
-                                
-                                # Filter split CSVs based on search
-                                filtered_csvs_new = split_csvs
-                                if search_term_new:
-                                    search_lower = search_term_new.lower()
-                                    filtered_csvs_new = [
-                                        csv for csv in split_csvs 
-                                        if search_lower in csv["name"].lower() or 
-                                        search_lower in str(summary_df[summary_df["Filename"] == csv["name"]]["Customer ID"].iloc[0] if len(summary_df[summary_df["Filename"] == csv["name"]]) > 0 else "").lower()
-                                    ]
-                                
-                                # Add individual download buttons for each split CSV
-                                st.subheader(f"Download Individual Split CSVs ({len(filtered_csvs_new)} of {len(split_csvs)})")
-                                if len(filtered_csvs_new) == 0:
-                                    st.info("No files match your search.")
-                                else:
-                                    for i, split_csv in enumerate(filtered_csvs_new):
-                                        col1, col2 = st.columns([3, 1])
-                                        with col1:
-                                            st.write(f"{i+1}. {split_csv['name']}")
-                                        with col2:
-                                            st.download_button(
-                                                "Download",
-                                                data=split_csv["bytes"],
-                                                file_name=split_csv["name"],
-                                                mime="text/csv",
-                                                key=f"dl_split_csv_{i}"
-                                            )
-                            else:
-                                st.warning("⚠️ No split CSVs created. Check that customer IDs are properly mapped.")
-    
-    elif current_step == 1:  # Step 2: Invoice Mapping
-        st.subheader("Invoice Mapping")
-        
-        st.info("Map each split CSV to the correct invoice using the Tabs API. Enter your API key and select the invoice issue date.")
-        
-        # Check if split CSVs are ready
-        if not st.session_state.get("split_csvs_ready"):
-            st.warning("⚠️ Please complete Step 1 first (Generate Split CSVs)")
-        else:
-            # API Key input
-            api_key_attach = st.text_input("Tabs API Key", type="password", key="ui_api_key_attach", 
-                                         value=st.session_state.get("invoice_api_key", ""),
-                                         help="Enter your Tabs API key for invoice mapping")
-            
-            if api_key_attach:
-                st.session_state["invoice_api_key"] = api_key_attach
-            
-            # Smart caching system for API invoices
-            st.markdown("---")
-            st.subheader("📋 Invoice Cache Management")
-            
-            # Check if we have cached invoices (with better persistence)
-            cache_key = f"invoice_cache_{api_key_attach[:10]}"
-            
-            # Try to get from session state first
-            cached_invoices = st.session_state.get(cache_key, [])
-            cache_timestamp = st.session_state.get(f"{cache_key}_timestamp", None)
-            
-            # If no cache in session state, try to load from file
-            if not cached_invoices:
-                try:
-                    import json
-                    cache_file = os.path.join(_CACHE_DIR, f"invoice_cache_{api_key_attach[:10]}.json")
-                    os.makedirs(_CACHE_DIR, exist_ok=True)
-                    if os.path.exists(cache_file):
-                        with open(cache_file, 'r') as f:
-                            cache_data = json.load(f)
-                            cached_invoices = cache_data.get('invoices', [])
-                            cache_timestamp_str = cache_data.get('timestamp')
-                            if cache_timestamp_str:
-                                cache_timestamp = datetime.fromisoformat(cache_timestamp_str)
-                        
-                        # Restore to session state
-                        st.session_state[cache_key] = cached_invoices
-                        st.session_state[f"{cache_key}_timestamp"] = cache_timestamp
-                        st.success(f"✅ Loaded {len(cached_invoices)} invoices from persistent cache")
-                except Exception as e:
-                    st.warning(f"Could not load persistent cache: {e}")
-                    cached_invoices = []
-                    cache_timestamp = None
-            
-            col1, col2, col3 = st.columns([2, 1, 1])
-            
-            with col1:
-                if cached_invoices:
-                    cache_age = datetime.now() - cache_timestamp if cache_timestamp else None
-                    if cache_age:
-                        age_hours = cache_age.total_seconds() / 3600
-                        st.success(f"✅ Cache: {len(cached_invoices)} invoices cached ({age_hours:.1f} hours ago)")
-                    else:
-                        st.success(f"✅ Cache: {len(cached_invoices)} invoices cached")
-                else:
-                    st.warning("⚠️ No invoice cache found")
-                    st.info("💡 Click 'Refresh Cache' to fetch all invoices from API (one-time setup)")
-            
-            with col2:
-                if st.button("🔄 Refresh Cache", help="Fetch fresh invoices from API"):
-                    if not api_key_attach:
-                        st.error("⚠️ Please enter API key first")
-                    else:
-                        with st.spinner("Fetching all invoices from API (this may take a few minutes)..."):
-                            all_invoices = fetch_all_invoices_for_cache(api_key_attach)
-                            if all_invoices:
-                                # Save to session state
-                                st.session_state[cache_key] = all_invoices
-                                st.session_state[f"{cache_key}_timestamp"] = datetime.now()
-                                
-                                # Also save to file for persistence
-                                try:
-                                    import json
-                                    cache_file = os.path.join(_CACHE_DIR, f"invoice_cache_{api_key_attach[:10]}.json")
-                                    os.makedirs(_CACHE_DIR, exist_ok=True)
-                                    cache_data = {
-                                        'invoices': all_invoices,
-                                        'timestamp': datetime.now().isoformat(),
-                                        'count': len(all_invoices)
-                                    }
-                                    with open(cache_file, 'w') as f:
-                                        json.dump(cache_data, f)
-                                    st.success(f"✅ Cached {len(all_invoices)} invoices successfully! (Saved to file)")
-                                except Exception as e:
-                                    st.success(f"✅ Cached {len(all_invoices)} invoices successfully! (File save failed: {e})")
-                                
-                                st.rerun()
-                            else:
-                                st.error("❌ Failed to fetch invoices")
-            
-            with col3:
-                if st.button("🗑️ Clear Cache", help="Clear cached invoices"):
-                    # Clear from session state
-                    if cache_key in st.session_state:
-                        del st.session_state[cache_key]
-                    if f"{cache_key}_timestamp" in st.session_state:
-                        del st.session_state[f"{cache_key}_timestamp"]
-                    
-                    # Also clear from file
-                    try:
-                        cache_file = os.path.join(_CACHE_DIR, f"invoice_cache_{api_key_attach[:10]}.json")
-                        os.makedirs(_CACHE_DIR, exist_ok=True)
-                        if os.path.exists(cache_file):
-                            os.remove(cache_file)
-                        st.success("✅ Cache cleared! (Both memory and file)")
-                    except Exception as e:
-                        st.success(f"✅ Cache cleared! (File removal failed: {e})")
-                    
-                    st.rerun()
-            
-            # Show cache recommendations
-            if cached_invoices and cache_timestamp:
-                cache_age = datetime.now() - cache_timestamp
-                age_hours = cache_age.total_seconds() / 3600
-                if age_hours > 24:
-                    st.warning("⚠️ Cache is older than 24 hours. Consider refreshing for new invoices.")
-                elif age_hours > 6:
-                    st.info("ℹ️ Cache is older than 6 hours. New invoices may not be included.")
-                else:
-                    st.info("✅ Cache is fresh and up-to-date.")
-            
-            st.markdown("---")
-            
-            # Invoice issue date selector
-            issue_date = st.date_input(
-                "Select Invoice Issue Date",
-                value=datetime.now().date(),
-                help="Select the issue date for the invoices you want to map to"
-            )
-            
-            if st.button("Map Invoices to Split CSVs", type="primary"):
-                if not api_key_attach:
-                    st.error("⚠️ Please enter API key first")
-                else:
-                    split_csvs = st.session_state.get("invoice_split_csvs", [])
-                    if not split_csvs:
-                        st.error("⚠️ No split CSVs found. Please complete Step 1 first.")
-                    else:
-                        with st.spinner("Mapping invoices..."):
-                            mapping_results = []
-                            
-                            for split_csv in split_csvs:
-                                csv_df = pd.read_csv(BytesIO(split_csv["bytes"]))
-                                customer_id = None
-                                
-                                # Try to get customer_id from the CSV
-                                if "customer_id" in csv_df.columns:
-                                    customer_ids = csv_df["customer_id"].dropna().unique()
-                                    if len(customer_ids) > 0:
-                                        customer_id = str(customer_ids[0]).strip()
-                                
-                                if not customer_id or customer_id == "nan":
-                                    mapping_results.append({
-                                        "split_csv_filename": split_csv["name"],
-                                        "customer_id": "N/A",
-                                        "invoice_id": "Not Found",
-                                        "status": "Failed",
-                                        "reason": "No customer ID in CSV"
-                                    })
-                                    continue
-                                
-                                # Look up invoice for this customer
-                                invoice_id = find_invoice_by_date(customer_id, issue_date, api_key_attach)
-                                
-                                if invoice_id:
-                                    mapping_results.append({
-                                        "split_csv_filename": split_csv["name"],
-                                        "customer_id": customer_id,
-                                        "invoice_id": invoice_id,
-                                        "status": "Success"
-                                    })
-                                else:
-                                    mapping_results.append({
-                                        "split_csv_filename": split_csv["name"],
-                                        "customer_id": customer_id,
-                                        "invoice_id": "Not Found",
-                                        "status": "Failed",
-                                        "reason": "No matching invoice found"
-                                    })
-                            
-                            mapping_df = pd.DataFrame(mapping_results)
-                            st.session_state["invoice_mapping"] = mapping_df
-                            st.session_state["invoice_mapping_ready"] = True
-                            
-                            # Show results
-                            success_count = (mapping_df["status"] == "Success").sum()
-                            st.success(f"✅ Mapped {success_count}/{len(mapping_df)} split CSVs to invoices")
-                            
-                            # Show successful mappings
-                            successful_mappings = mapping_df[mapping_df["status"] == "Success"]
-                            if len(successful_mappings) > 0:
-                                st.dataframe(successful_mappings[["split_csv_filename", "customer_id", "invoice_id"]], use_container_width=True)
-                            
-                            # Show unmapped files
-                            unmapped = mapping_df[mapping_df["status"] == "Failed"]
-                            if len(unmapped) > 0:
-                                st.warning(f"⚠️ {len(unmapped)} Split CSVs Requiring Attention")
-                                st.dataframe(unmapped, use_container_width=True)
-    
-    elif current_step == 2:  # Step 3: Bulk Upload
-        st.subheader("Bulk Upload CSV Attachments")
-        
-        st.info("Upload all mapped CSV files as attachments to their corresponding invoices.")
-        
-        # Check if mapping is ready
-        mapping_ready = False
-        mapping_df = None
-        
-        # Option to upload mapping CSV (takes priority over generated mapping)
-        uploaded_mapping = st.file_uploader("Upload Invoice Mapping CSV (optional)", type=["csv"], key="upload_mapping_csv")
-        
-        if uploaded_mapping is not None:
-            # User uploaded a CSV - use it instead of the generated mapping
-            try:
-                mapping_df = pd.read_csv(uploaded_mapping)
-                required_cols = ["split_csv_filename", "customer_id", "invoice_id"]
-                if all(col in mapping_df.columns for col in required_cols):
-                    mapping_ready = True
-                    st.success(f"✅ Loaded {len(mapping_df)} mappings from uploaded CSV (overriding generated mapping)")
-                    st.dataframe(mapping_df, use_container_width=True)
-                else:
-                    st.error(f"CSV must have columns: {', '.join(required_cols)}")
-                    mapping_ready = False
-            except Exception as e:
-                st.error(f"Error reading CSV: {str(e)}")
-                mapping_ready = False
-        else:
-            # No file uploaded - use generated mapping from Step 2
-            if not st.session_state.get("invoice_mapping_ready"):
-                st.warning("⚠️ Please complete Step 2 first (Invoice Mapping) or upload a CSV mapping file")
-                mapping_ready = False
-            else:
-                mapping_df = st.session_state.get("invoice_mapping")
-                mapping_ready = True
-        
-        if mapping_ready and mapping_df is not None:
-            split_csvs = st.session_state.get("invoice_split_csvs", [])
-            
-            if not split_csvs:
-                st.warning("⚠️ Split CSVs not found. Please complete Step 1 first (Generate Split CSVs)")
-            else:
-                # Filter to only include successful mappings (status == "Success" and invoice_id != "Not Found")
-                successful_mappings = mapping_df[
-                    (mapping_df["status"] == "Success") & 
-                    (mapping_df["invoice_id"] != "Not Found") &
-                    (mapping_df["invoice_id"].notna())
-                ].copy()
-                
-                failed_count = len(mapping_df) - len(successful_mappings)
-                if failed_count > 0:
-                    st.warning(f"⚠️ {failed_count} split CSV(s) were not mapped to invoices and will be excluded from upload")
-                
-                st.info(f"📋 Ready to upload {len(successful_mappings)} split CSVs to invoices")
-                
-                # Create lookup dict for split CSVs
-                split_csvs_dict = {split_csv["name"]: split_csv for split_csv in split_csvs}
-            
-                # Show preview (only successful mappings)
-                st.subheader("Upload Preview")
-                preview_df = successful_mappings.copy()
-                preview_df["split_csv_size"] = preview_df["split_csv_filename"].map(
-                    lambda x: len(pd.read_csv(BytesIO(split_csvs_dict[x]["bytes"]))) if x in split_csvs_dict else 0
-                )
-                preview_df["split_csv_exists"] = preview_df["split_csv_filename"].map(
-                    lambda x: "Yes" if x in split_csvs_dict else "No"
-                )
-                st.dataframe(preview_df, use_container_width=True)
-                
-                # Check for missing split CSVs
-                missing_csvs = preview_df[preview_df["split_csv_exists"] == "No"]["split_csv_filename"].tolist()
-                if missing_csvs:
-                    st.warning(f"⚠️ {len(missing_csvs)} split CSV(s) not found: {', '.join(missing_csvs[:5])}{'...' if len(missing_csvs) > 5 else ''}")
-                
-                api_key = st.session_state.get('invoice_api_key', '')
-                
-                if not api_key:
-                    st.warning("⚠️ Please enter API key in Step 2")
-                else:
-                    # Add test mode option
-                    test_mode = st.checkbox("🧪 Test Mode: Upload only one row from the first split CSV", value=False)
-                    
-                    if st.button("Start Bulk Upload", type="primary"):
-                        try:
-                            with st.spinner("Uploading CSV attachments..."):
-                                upload_results = []
-                                progress_bar = st.progress(0)
-                                
-                                # Limit to first row if test mode is enabled (only use successful mappings)
-                                rows_to_process = successful_mappings.head(1) if test_mode else successful_mappings
-                                
-                                for idx, row in rows_to_process.iterrows():
-                                    split_csv_name = row["split_csv_filename"]
-                                    customer_id = row["customer_id"]
-                                    invoice_id = row["invoice_id"]
-                                    
-                                    if split_csv_name not in split_csvs_dict:
-                                        upload_results.append({
-                                            "split_csv": split_csv_name,
-                                            "status": "Failed",
-                                            "reason": "Split CSV not found"
-                                        })
-                                        continue
-                                    
-                                    split_csv_bytes = split_csvs_dict[split_csv_name]["bytes"]
-                                    
-                                    # In test mode, create a CSV with only the first row
-                                    if test_mode:
-                                        try:
-                                            test_df = pd.read_csv(BytesIO(split_csv_bytes))
-                                            if len(test_df) > 0:
-                                                # Keep only the first row
-                                                test_df = test_df.head(1)
-                                                # Create new filename with "_test" suffix
-                                                test_filename = split_csv_name.replace(".csv", "_test.csv")
-                                                split_csv_bytes = test_df.to_csv(index=False).encode("utf-8")
-                                                split_csv_name = test_filename
-                                            else:
-                                                upload_results.append({
-                                                    "split_csv": split_csv_name,
-                                                    "status": "Failed",
-                                                    "reason": "CSV is empty"
-                                                })
-                                                continue
-                                        except Exception as e:
-                                            upload_results.append({
-                                                "split_csv": split_csv_name,
-                                                "status": "Failed",
-                                                "reason": f"Error reading CSV: {str(e)}"
-                                            })
-                                            continue
-                                    
-                                    # Upload CSV as attachment to invoice
-                                    success = upload_csv_attachment(
-                                        customer_id,
-                                        invoice_id,
-                                        split_csv_bytes,
-                                        split_csv_name,
-                                        api_key
-                                    )
-                                    
-                                    upload_results.append({
-                                        "split_csv": split_csv_name,
-                                        "customer_id": customer_id,
-                                        "invoice_id": invoice_id,
-                                        "status": "Success" if success else "Failed",
-                                        "reason": "" if success else "Upload failed"
-                                    })
-                                    
-                                    progress_bar.progress((idx + 1) / len(rows_to_process))
-                                
-                                results_df = pd.DataFrame(upload_results)
-                                st.session_state["upload_results"] = results_df
-                                
-                                success_count = (results_df["status"] == "Success").sum()
-                                progress_bar.empty()
-                                
-                                if test_mode:
-                                    st.success(f"✅ Test upload complete! {success_count}/{len(results_df)} successful")
-                                else:
-                                    st.success(f"✅ Upload complete! {success_count}/{len(results_df)} successful")
-                                
-                        except Exception as e:
-                            st.error(f"Error during bulk upload: {str(e)}")
-                            import traceback
-                            st.code(traceback.format_exc())
-        if st.session_state.get("invoice_split_csvs_ready"):
-            split_csvs = st.session_state.get("invoice_split_csvs", [])
-            if split_csvs:
-                # Show split CSV summary
-                split_csv_summary = pd.DataFrame([
-                    {"Filename": split_csv["name"], "Size (rows)": len(pd.read_csv(BytesIO(split_csv["bytes"])))}
-                    for split_csv in split_csvs
-                ])
-                st.dataframe(split_csv_summary, use_container_width=True)
-                
-                st.markdown("---")
-                st.subheader("Download Options")
-                
-                # Option to download individual files
-                with st.expander("Download Individual CSVs"):
-                    cols = st.columns(min(3, len(split_csvs)))
-                    for idx, split_csv in enumerate(split_csvs):
-                        with cols[idx % len(cols)]:
-                            st.download_button(
-                                label=split_csv['name'],
-                                data=split_csv["bytes"],
-                                file_name=split_csv["name"],
-                                mime="text/csv",
-                                key=f"download_split_csv_{idx}"
-                            )
-                
-                # Download all option
-                import zipfile
-                zip_buffer = BytesIO()
-                with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-                    for split_csv in split_csvs:
-                        zip_file.writestr(split_csv["name"], split_csv["bytes"])
-                zip_buffer.seek(0)
-                st.download_button(
-                    "Download All Split CSVs (ZIP)",
-                    data=zip_buffer.getvalue(),
-                    file_name="all_split_csvs.zip",
-                    mime="application/zip",
-                    key="download_all_split_csvs"
-                )
-    
-    elif current_step == 1:  # Step 2: Invoice Mapping
-        st.subheader("Invoice Mapping")
-        
-        if not st.session_state.get("invoice_split_csvs_ready"):
-            st.warning("⚠️ Please complete Step 1 first (Generate Split CSVs)")
-        else:
-            split_csvs = st.session_state.get("invoice_split_csvs", [])
-            st.info(f"📋 {len(split_csvs)} split CSV files ready for invoice mapping")
-                
-            # API Configuration
-            st.subheader("API Configuration")
-            api_key = st.text_input(
-                "Tabs API Key",
-                type="password",
-                help="Enter your TABS API key for invoice lookup",
-                value=st.session_state.get('invoice_api_key', ''),
-                key="invoice_api_key_input"
-            )
-                
-            if api_key:
-                st.session_state['invoice_api_key'] = api_key
-            
-            # Smart caching system for API invoices (matching reference_code)
-            if api_key:
-                st.subheader("Invoice Cache Management")
-                
-                # Check if we have cached invoices (with better persistence)
-                cache_key = f"invoice_cache_{api_key[:10]}"
-                
-                # Try to get from session state first
-                cached_invoices = st.session_state.get(cache_key, [])
-                cache_timestamp = st.session_state.get(f"{cache_key}_timestamp", None)
-                
-                # If no cache in session state, try to load from file
-                if not cached_invoices:
-                    try:
-                        import json
-                        cache_file = os.path.join(_CACHE_DIR, f"invoice_cache_{api_key[:10]}.json")
-                        if os.path.exists(cache_file):
-                            with open(cache_file, 'r') as f:
-                                cache_data = json.load(f)
-                                cached_invoices = cache_data.get('invoices', [])
-                                cache_timestamp_str = cache_data.get('timestamp')
-                                if cache_timestamp_str:
-                                    try:
-                                        if isinstance(cache_timestamp_str, (int, float)):
-                                            cache_timestamp = datetime.fromtimestamp(cache_timestamp_str)
-                                        else:
-                                            cache_timestamp = datetime.fromisoformat(cache_timestamp_str)
-                                    except Exception:
-                                        cache_timestamp = None
-                                    
-                                # Restore to session state
-                                st.session_state[cache_key] = cached_invoices
-                                st.session_state[f"{cache_key}_timestamp"] = cache_timestamp
-                                st.success(f"✅ Loaded {len(cached_invoices)} invoices from persistent cache")
-                    except Exception as e:
-                        st.warning(f"Could not load persistent cache: {e}")
-                        cached_invoices = []
-                        cache_timestamp = None
-                
-                col1, col2, col3 = st.columns([2, 1, 1])
-                
-                with col1:
-                    if cached_invoices:
-                        cache_age = datetime.now() - cache_timestamp if cache_timestamp else None
-                        if cache_age:
-                            age_hours = cache_age.total_seconds() / 3600
-                            st.success(f"✅ Cache: {len(cached_invoices)} invoices cached ({age_hours:.1f} hours ago)")
-                        else:
-                            st.success(f"✅ Cache: {len(cached_invoices)} invoices cached")
-                    else:
-                        st.warning("⚠️ No invoice cache found")
-                        st.info("💡 Click 'Refresh Cache' to fetch all invoices from API (one-time setup)")
-                
-                with col2:
-                    if st.button("🔄 Refresh Cache", help="Fetch fresh invoices from API"):
-                        # Clear existing cache first
-                        if cache_key in st.session_state:
-                            del st.session_state[cache_key]
-                        if f"{cache_key}_timestamp" in st.session_state:
-                            del st.session_state[f"{cache_key}_timestamp"]
-                        
-                        # Also clear from file
-                        try:
-                            cache_file = os.path.join(_CACHE_DIR, f"invoice_cache_{api_key[:10]}.json")
-                            if os.path.exists(cache_file):
-                                os.remove(cache_file)
-                        except Exception:
-                            pass
-                        
-                        with st.spinner("Fetching all invoices from API (this may take a few minutes)..."):
-                            all_invoices = fetch_all_invoices_for_cache(api_key)
-                            if all_invoices:
-                                # Save to session state
-                                st.session_state[cache_key] = all_invoices
-                                st.session_state[f"{cache_key}_timestamp"] = datetime.now()
-                                
-                                # Also save to file for persistence
-                                try:
-                                    import json
-                                    _ensure_cache_dir_exists()
-                                    cache_file = os.path.join(_CACHE_DIR, f"invoice_cache_{api_key[:10]}.json")
-                                    cache_data = {
-                                        'invoices': all_invoices,
-                                        'timestamp': datetime.now().isoformat(),
-                                        'count': len(all_invoices)
-                                    }
-                                    with open(cache_file, 'w') as f:
-                                        json.dump(cache_data, f)
-                                    st.success(f"✅ Cached {len(all_invoices)} invoices successfully! (Saved to file)")
-                                except Exception as e:
-                                    st.success(f"✅ Cached {len(all_invoices)} invoices successfully! (File save failed: {e})")
-                                
-                                st.rerun()
-                            else:
-                                st.error("❌ Failed to fetch invoices")
-                
-                with col3:
-                    if st.button("🗑️ Clear Cache", help="Clear cached invoices"):
-                        # Clear from session state
-                        if cache_key in st.session_state:
-                            del st.session_state[cache_key]
-                        if f"{cache_key}_timestamp" in st.session_state:
-                            del st.session_state[f"{cache_key}_timestamp"]
-                        
-                        # Also clear from file
-                        try:
-                            cache_file = os.path.join(_CACHE_DIR, f"invoice_cache_{api_key[:10]}.json")
-                            if os.path.exists(cache_file):
-                                os.remove(cache_file)
-                            st.success("✅ Cache cleared! (Both memory and file)")
-                        except Exception as e:
-                            st.success(f"✅ Cache cleared! (File removal failed: {e})")
-                        
-                        st.rerun()
-                
-                # Show cache recommendations
-                if cached_invoices and cache_timestamp:
-                    cache_age = datetime.now() - cache_timestamp
-                    age_hours = cache_age.total_seconds() / 3600
-                    if age_hours > 24:
-                        st.warning("⚠️ Cache is older than 24 hours. Consider refreshing for new invoices.")
-                    elif age_hours > 6:
-                        st.info("ℹ️ Cache is older than 6 hours. New invoices may not be included.")
-                    else:
-                        st.info("✅ Cache is fresh and up-to-date.")
-        
-        # Date picker for issue date
-        st.subheader("Invoice Issue Date")
-        issue_date = st.date_input(
-            "Select the issue date for invoice lookup:",
-            value=datetime.today().date(),
-            help="This date will be used to find matching invoices",
-            key="invoice_issue_date"
-        )
-        
-        if st.button("Map Invoices to Split CSVs", type="primary"):
-            if not api_key:
-                st.error("Please provide API key")            
-            else:
-                try:
-                    mapping_data = []
-                    problematic_split_csvs = []
-                    
-                    st.info(f"📋 Processing {len(split_csvs)} split CSV files...")
-                    
-                    for i, split_csv in enumerate(split_csvs, 1):
-                        split_csv_df = pd.read_csv(BytesIO(split_csv["bytes"]))
-                        
-                        # Get unique customer IDs from split CSV
-                        customer_ids = split_csv_df["customer_id"].dropna().unique()
-                        
-                        st.write(f"📄 Processing {i}/{len(split_csvs)}: {split_csv['name']}")
-                        
-                        if len(customer_ids) == 0:
-                            st.warning(f"   ⚠️ No customer IDs found in split CSV")
-                            problematic_split_csvs.append({
-                                "split_csv_filename": split_csv["name"],
-                                "customer_id": "N/A",
-                                "issue_date": issue_date.strftime("%Y-%m-%d"),
-                                "issue": "No customer IDs found"
-                            })
-                            st.write("---")
-                            continue
-                        
-                        # For now, use first customer_id (each split CSV should be per customer)
-                        customer_id = customer_ids[0]
-                        st.write(f"   Customer ID: {customer_id}")
-                        
-                        # Find invoice ID by customer and issue date
-                        st.write(f"   Looking up invoice for date: {issue_date.strftime('%Y-%m-%d')}")
-                        
-                        invoice_id = find_invoice_by_date(customer_id, issue_date, api_key)
-                        
-                        if not invoice_id:
-                            st.warning(f"   ⚠️ No matching invoice found for customer {customer_id} on {issue_date}")
-                            problematic_split_csvs.append({
-                                "split_csv_filename": split_csv["name"],
-                                "customer_id": customer_id,
-                                "issue_date": issue_date.strftime("%Y-%m-%d"),
-                                "issue": f"No matching invoice found for customer {customer_id} on {issue_date}"
-                            })
-                            st.error(f"   ❌ No invoice ID found")
-                        else:
-                            st.success(f"   ✅ Invoice ID: {invoice_id}")
-                            mapping_data.append({
-                                "split_csv_filename": split_csv["name"],
-                                "customer_id": customer_id,
-                                "invoice_id": invoice_id,
-                                "issue_date": issue_date.strftime("%Y-%m-%d")
-                            })
-                        
-                        st.write("---")
-                        
-                    # Show results summary after processing all split CSVs
-                    if mapping_data:
-                        mapping_df = pd.DataFrame(mapping_data)
-                        st.session_state["invoice_mapping"] = mapping_df
-                        st.session_state["invoice_mapping_ready"] = True
-                        
-                        st.success(f"✅ **Invoice mapping completed!**")
-                        st.info(f"**Results:** {len(mapping_df)} split CSVs successfully mapped, {len(problematic_split_csvs)} split CSVs need attention")
-                        st.dataframe(mapping_df, use_container_width=True)
-                    else:
-                        st.error("No valid invoice mappings could be created")
-                    
-                    # Create problematic split CSVs DataFrame and store in session state
-                    if problematic_split_csvs:
-                        problematic_df = pd.DataFrame(problematic_split_csvs)
-                        st.session_state["invoice_problematic_split_csvs"] = problematic_df
-                    else:
-                        st.session_state["invoice_problematic_split_csvs"] = None
-                    
-                except Exception as e:
-                    st.error(f"Error creating invoice mapping: {str(e)}")
-                    import traceback
-                    st.code(traceback.format_exc())
-        
-        # Display problematic split CSVs if any (matching reference_code pattern)
-        if 'invoice_problematic_split_csvs' in st.session_state and st.session_state.invoice_problematic_split_csvs is not None:
-            df_problematic = st.session_state.invoice_problematic_split_csvs
-            
-            if len(df_problematic) > 0:
-                st.markdown("---")
-                st.subheader("⚠️ Split CSVs Requiring Attention")
-                st.warning(f"**{len(df_problematic)} split CSVs could not be mapped to invoices**")
-                st.dataframe(df_problematic, use_container_width=True)
-                
-                # Download button for problematic split CSVs
-                problematic_csv_bytes = df_problematic.to_csv(index=False).encode('utf-8')
-                st.download_button(
-                    "Download Unmapped Split CSVs CSV",
-                    data=problematic_csv_bytes,
-                    file_name="invoice_mapping_problematic.csv",
-                    mime="text/csv"
-                )
-    
-    elif current_step == 2:  # Step 3: Bulk Upload
-        
-        
-        # Option to upload invoice mapping CSV
-        st.markdown("---")
-        st.subheader("Bulk Upload")
-        
-        upload_option = st.radio(
-            "Choose mapping source:",
-            ["Use generated mapping from Step 2", "Upload CSV mapping file"],
-            key="bulk_upload_mapping_source"
-        )
-        
-        mapping_df = None
-        mapping_ready = False
-        
-        if upload_option == "Upload CSV mapping file":
-            uploaded_mapping = st.file_uploader(
-                "Upload Invoice Mapping CSV",
-                type="csv",
-                help="CSV should have columns: split_csv_filename, customer_id, invoice_id (and optionally issue_date)",
-                key="bulk_upload_mapping_csv"
-            )
+            # Option to upload mapping CSV (takes priority over generated mapping)
+            uploaded_mapping = st.file_uploader("Upload Invoice Mapping CSV (optional)", type=["csv"], key="upload_mapping_csv")
             
             if uploaded_mapping is not None:
+                # User uploaded a CSV - use it instead of generating mapping
                 try:
                     mapping_df = pd.read_csv(uploaded_mapping)
-                    # Validate required columns
                     required_cols = ["split_csv_filename", "customer_id", "invoice_id"]
-                    missing_cols = [col for col in required_cols if col not in mapping_df.columns]
-                    
-                    if missing_cols:
-                        st.error(f"❌ Missing required columns: {', '.join(missing_cols)}")
-                        st.info("Required columns: split_csv_filename, customer_id, invoice_id")
-                    else:
-                        mapping_ready = True
-                        st.success(f"✅ Loaded {len(mapping_df)} mappings from CSV")
+                    if all(col in mapping_df.columns for col in required_cols):
+                        st.session_state["invoice_mapping"] = mapping_df
+                        st.session_state["invoice_mapping_ready"] = True
+                        st.success(f"✅ Loaded {len(mapping_df)} mappings from uploaded CSV")
                         st.dataframe(mapping_df, use_container_width=True)
+                    else:
+                        st.error(f"CSV must have columns: {', '.join(required_cols)}")
                 except Exception as e:
                     st.error(f"Error reading CSV: {str(e)}")
-        else:
-            # Use generated mapping from Step 2
-            if not st.session_state.get("invoice_mapping_ready"):
-                st.warning("⚠️ Please complete Step 2 first (Invoice Mapping) or upload a CSV mapping file")
             else:
-                mapping_df = st.session_state.get("invoice_mapping")
-                mapping_ready = True
+                # No file uploaded - generate mapping via API
+                st.markdown("---")
+                
+                # Invoice issue date selector
+                issue_date = st.date_input(
+                    "Select Invoice Issue Date",
+                    value=datetime.now().date(),
+                    help="Select the issue date for the invoices you want to map to"
+                )
+                
+                if st.button("Map Invoices to Split CSVs", type="primary"):
+                    if not api_key_attach:
+                        st.error("⚠️ Please enter API key first")
+                    elif not st.session_state.get("split_csvs_ready"):
+                        st.error("⚠️ No split CSVs found. Please complete Step 1 first.")
+                    else:
+                        split_csvs = st.session_state.get("invoice_split_csvs", [])
+                        with st.spinner("Mapping invoices..."):
+                            mapping_results = []
+                            
+                            for split_csv in split_csvs:
+                                csv_df = pd.read_csv(BytesIO(split_csv["bytes"]))
+                                customer_id = None
+                                
+                                # Try to get customer_id from the CSV
+                                if "customer_id" in csv_df.columns:
+                                    customer_ids = csv_df["customer_id"].dropna().unique()
+                                    # Validate: each split CSV must contain exactly one unique customer_id
+                                    if len(customer_ids) == 0:
+                                        mapping_results.append({
+                                            "split_csv_filename": split_csv["name"],
+                                            "customer_id": "N/A",
+                                            "invoice_id": "Not Found",
+                                            "status": "Failed",
+                                            "reason": "No customer ID in CSV"
+                                        })
+                                        continue
+                                    elif len(customer_ids) > 1:
+                                        mapping_results.append({
+                                            "split_csv_filename": split_csv["name"],
+                                            "customer_id": f"Multiple: {', '.join(map(str, customer_ids[:3]))}",
+                                            "invoice_id": "Not Found",
+                                            "status": "Failed",
+                                            "reason": f"CSV contains {len(customer_ids)} unique customer IDs (must be exactly 1)"
+                                        })
+                                        continue
+                                    else:
+                                        customer_id = str(customer_ids[0]).strip()
+                                
+                                if not customer_id or customer_id == "nan":
+                                    mapping_results.append({
+                                        "split_csv_filename": split_csv["name"],
+                                        "customer_id": "N/A",
+                                        "invoice_id": "Not Found",
+                                        "status": "Failed",
+                                        "reason": "No customer ID in CSV"
+                                    })
+                                    continue
+                                
+                                # Look up invoice for this customer
+                                invoice_id = find_invoice_by_date(customer_id, issue_date, api_key_attach)
+                                
+                                if invoice_id:
+                                    mapping_results.append({
+                                        "split_csv_filename": split_csv["name"],
+                                        "customer_id": customer_id,
+                                        "invoice_id": invoice_id,
+                                        "status": "Success"
+                                    })
+                                else:
+                                    mapping_results.append({
+                                        "split_csv_filename": split_csv["name"],
+                                        "customer_id": customer_id,
+                                        "invoice_id": "Not Found",
+                                        "status": "Failed",
+                                        "reason": "No matching invoice found"
+                                    })
+                            
+                            mapping_df = pd.DataFrame(mapping_results)
+                            st.session_state["invoice_mapping"] = mapping_df
+                            st.session_state["invoice_mapping_ready"] = True
+                            
+                            # Show results
+                            success_count = (mapping_df["status"] == "Success").sum()
+                            st.success(f"✅ Mapped {success_count}/{len(mapping_df)} split CSVs to invoices")
+                            
+                            # Show successful mappings
+                            successful_mappings = mapping_df[mapping_df["status"] == "Success"]
+                            if len(successful_mappings) > 0:
+                                st.dataframe(successful_mappings[["split_csv_filename", "customer_id", "invoice_id"]], use_container_width=True)
+                            
+                            # Show unmapped files
+                            unmapped = mapping_df[mapping_df["status"] == "Failed"]
+                            if len(unmapped) > 0:
+                                st.warning(f"⚠️ {len(unmapped)} Split CSVs Requiring Attention")
+                                st.dataframe(unmapped, use_container_width=True)
+    
+    elif current_step == 2:  # Step 3: Bulk Upload
+        st.subheader("Bulk Upload CSV Attachments")
+        
+        st.info("Upload all mapped CSV files as attachments to their corresponding invoices.")
+        
+        # Check if mapping is ready
+        mapping_ready = False
+        mapping_df = None
+        
+        # Use mapping from Step 2
+        if not st.session_state.get("invoice_mapping_ready"):
+            st.warning("⚠️ Please complete Step 2 first (Invoice Mapping)")
+            mapping_ready = False
+        else:
+            mapping_df = st.session_state.get("invoice_mapping")
+            mapping_ready = True
         
         if mapping_ready and mapping_df is not None:
-            split_csvs = st.session_state.get("invoice_split_csvs", [])
-            
-            if not split_csvs:
+            if not st.session_state.get("split_csvs_ready"):
                 st.warning("⚠️ Split CSVs not found. Please complete Step 1 first (Generate Split CSVs)")
             else:
+                split_csvs = st.session_state.get("invoice_split_csvs", [])
                 # Filter to only include successful mappings (status == "Success" and invoice_id != "Not Found")
                 successful_mappings = mapping_df[
                     (mapping_df["status"] == "Success") & 
@@ -5767,6 +4864,33 @@ with chunk_tab:
                                     
                                     split_csv_bytes = split_csvs_dict[split_csv_name]["bytes"]
                                     
+                                    # Validate: each split CSV must contain exactly one unique customer_id
+                                    try:
+                                        validation_df = pd.read_csv(BytesIO(split_csv_bytes))
+                                        if "customer_id" in validation_df.columns:
+                                            unique_customer_ids = validation_df["customer_id"].dropna().unique()
+                                            if len(unique_customer_ids) == 0:
+                                                upload_results.append({
+                                                    "split_csv": split_csv_name,
+                                                    "status": "Failed",
+                                                    "reason": "CSV contains no customer IDs"
+                                                })
+                                                continue
+                                            elif len(unique_customer_ids) > 1:
+                                                upload_results.append({
+                                                    "split_csv": split_csv_name,
+                                                    "status": "Failed",
+                                                    "reason": f"CSV contains {len(unique_customer_ids)} unique customer IDs (must be exactly 1): {', '.join(map(str, unique_customer_ids[:3]))}"
+                                                })
+                                                continue
+                                    except Exception as e:
+                                        upload_results.append({
+                                            "split_csv": split_csv_name,
+                                            "status": "Failed",
+                                            "reason": f"Error validating CSV: {str(e)}"
+                                        })
+                                        continue
+                                    
                                     # In test mode, create a CSV with only the first row
                                     if test_mode:
                                         try:
@@ -5827,3 +4951,4 @@ with chunk_tab:
                             st.error(f"Error during bulk upload: {str(e)}")
                             import traceback
                             st.code(traceback.format_exc())
+    

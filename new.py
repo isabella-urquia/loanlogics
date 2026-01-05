@@ -2811,76 +2811,7 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
     
     mapped_df = combined_internal[valid_customer_mask].copy()  # Use valid_customer_mask instead of ~unmapped_mask
     
-    # Group by customer_id and differentiator to combine multiple rows per customer
-    # This ensures Finastra accounts (with different differentiators) remain separate
-    if len(mapped_df) > 0:
-        # Determine aggregation strategy for each column
-        agg_dict = {}
-        for col in upload_cols:
-            if col in mapped_df.columns:
-                if col == "value":
-                    # Value will be recalculated based on event type after grouping
-                    agg_dict[col] = "sum"  # Temporary, will be overwritten
-                elif col in ["UnitsAsPerSubmission", "IsInitialSubmission"]:
-                    # These are already aggregated per customer/account, so use "first" or "max" to avoid doubling
-                    # We'll recalculate them properly after grouping
-                    agg_dict[col] = "first"
-                elif col == "event_type_name":
-                    # For event_type_name, if customer has multiple rows, keep the first one
-                    # (The validation should have already corrected them to match API)
-                    agg_dict[col] = "first"
-                else:
-                    # Keep first value for other text columns
-                    agg_dict[col] = "first"
-        
-        # Group by customer_id and differentiator to keep Finastra accounts separate
-        # Use differentiator if available, otherwise just customer_id
-        if "differentiator" in mapped_df.columns:
-            group_keys = ["customer_id", "differentiator"]
-            
-        else:
-            group_keys = ["customer_id"]
-        
-        # Group and aggregate - this will combine "app" and "unit" rows but keep Finastra accounts separate
-        combined = mapped_df.groupby(group_keys, as_index=False).agg(agg_dict)[upload_cols]
-        
-        # Recalculate UnitsAsPerSubmission and IsInitialSubmission from the original grouped data
-        # to avoid double-counting when combining "app" and "unit" rows
-        if "customer_id" in combined.columns:
-            for idx, row in combined.iterrows():
-                customer_id = row["customer_id"]
-                differentiator = row.get("differentiator", "")
-                
-                # Find matching rows in mapped_df
-                if differentiator:
-                    matching_mask = (mapped_df["customer_id"] == customer_id) & (mapped_df["differentiator"] == differentiator)
-                else:
-                    matching_mask = mapped_df["customer_id"] == customer_id
-                
-                matching_rows = mapped_df[matching_mask]
-                
-                # Get the values from the first row (they should all be the same since they're already aggregated)
-                if len(matching_rows) > 0:
-                    first_row = matching_rows.iloc[0]
-                    combined.loc[idx, "UnitsAsPerSubmission"] = first_row.get("UnitsAsPerSubmission", 0)
-                    combined.loc[idx, "IsInitialSubmission"] = first_row.get("IsInitialSubmission", 0)
-        
-        # Set value based on event_type_name:
-        # - "app" events use IsInitialSubmission
-        # - "unit" events use UnitsAsPerSubmission
-        if "event_type_name" in combined.columns and "IsInitialSubmission" in combined.columns and "UnitsAsPerSubmission" in combined.columns:
-            # Convert to numeric
-            combined["IsInitialSubmission"] = pd.to_numeric(combined["IsInitialSubmission"], errors="coerce").fillna(0)
-            combined["UnitsAsPerSubmission"] = pd.to_numeric(combined["UnitsAsPerSubmission"], errors="coerce").fillna(0)
-            
-            # Set value based on event type
-            app_mask = combined["event_type_name"].str.lower().isin(["app", "lbpa app"])
-            unit_mask = combined["event_type_name"].str.lower().isin(["unit", "lbpa unit"])
-            
-            combined.loc[app_mask, "value"] = combined.loc[app_mask, "IsInitialSubmission"]
-            combined.loc[unit_mask, "value"] = combined.loc[unit_mask, "UnitsAsPerSubmission"]
-    else:
-        combined = pd.DataFrame(columns=upload_cols)
+    combined = mapped_df[upload_cols].copy()
     unmapped_output = unmapped_df[upload_cols] if len(unmapped_df) > 0 else pd.DataFrame(columns=upload_cols)
     
     

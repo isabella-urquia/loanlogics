@@ -1939,8 +1939,18 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
             grouped["datetime"] = pd.to_datetime(usage_date).strftime("%Y-%m-%d")
         else:
             grouped["datetime"] = pd.to_datetime(grouped["datetime"], errors="coerce").dt.strftime("%Y-%m-%d")
-        # For account_id: use __group_key__ which is AccountID for Finastra, __acct_key__ for others
-        grouped["account_id"] = grouped["__group_key__"] if "__group_key__" in grouped.columns else grouped["__acct_key__"]
+        # account_id always represents CustomerNumber (__acct_key__)
+        grouped["account_id"] = grouped["__acct_key__"] if "__acct_key__" in grouped.columns else pd.NA
+        
+        # Store Finastra AccountID in separate column (from __group_key__ when it's Finastra)
+        grouped["__finastra_account_id__"] = pd.NA
+        if finastra_mask.any() and "__group_key__" in grouped.columns:
+            # For Finastra rows, __group_key__ contains AccountID (normalized numeric string)
+            # Map back to grouped dataframe to identify Finastra rows
+            grouped_finastra_mask = grouped["AccountName"].astype(str).str.contains("Finastra", case=False, na=False)
+            if grouped_finastra_mask.any():
+                grouped.loc[grouped_finastra_mask, "__finastra_account_id__"] = grouped.loc[grouped_finastra_mask, "__group_key__"]
+        
         # Include __original_account_name__ in return if it exists
         return_cols = ["customer_id", "AccountName", "event_type_name", "datetime", "value", "differentiator", "account_id"]
         if "__original_account_name__" in grouped.columns:
@@ -1948,6 +1958,9 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
         # Include AccountID if it exists (needed for Finastra differentiators)
         if "AccountID" in grouped.columns:
             return_cols.append("AccountID")
+        # Include __finastra_account_id__ if it exists (for Finastra differentiators)
+        if "__finastra_account_id__" in grouped.columns:
+            return_cols.append("__finastra_account_id__")
         return grouped[return_cols]
 
     income_df = pd.read_csv(uploaded_income)
@@ -2166,13 +2179,19 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
             # For common keys, remove from units (keep the "app" row)
             income_upload_units_filtered = income_upload_units_filtered[~income_upload_units_filtered["__match_key__"].isin(common_keys)]
         
-        # Remove helper columns (all columns starting with "__")
-        helper_cols_apps = [col for col in income_upload_apps_filtered.columns if col.startswith("__")]
-        helper_cols_units = [col for col in income_upload_units_filtered.columns if col.startswith("__")]
+        # Remove helper columns (all columns starting with "__" except __original_account_name__ which we preserve)
+        helper_cols_apps = [col for col in income_upload_apps_filtered.columns if col.startswith("__") and col != "__original_account_name__"]
+        helper_cols_units = [col for col in income_upload_units_filtered.columns if col.startswith("__") and col != "__original_account_name__"]
         if helper_cols_apps:
             income_upload_apps_filtered = income_upload_apps_filtered.drop(columns=helper_cols_apps, errors="ignore")
         if helper_cols_units:
             income_upload_units_filtered = income_upload_units_filtered.drop(columns=helper_cols_units, errors="ignore")
+        
+        # Rename __original_account_name__ to original_account_name to preserve it
+        if "__original_account_name__" in income_upload_apps_filtered.columns:
+            income_upload_apps_filtered = income_upload_apps_filtered.rename(columns={"__original_account_name__": "original_account_name"})
+        if "__original_account_name__" in income_upload_units_filtered.columns:
+            income_upload_units_filtered = income_upload_units_filtered.rename(columns={"__original_account_name__": "original_account_name"})
     
     # Concatenate Income apps and units (only rows with values > 0, duplicates removed)
     income_upload = pd.concat([income_upload_apps_filtered, income_upload_units_filtered], ignore_index=True)
@@ -2207,11 +2226,11 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
                 mapped_by_account_id = finastra_account_ids.map(account_id_to_name_map)
                 mapped_differentiators = mapped_by_account_id.fillna("")
             
-            # Method 2: Fallback to account_id column (extracted from CustomerNumber) if AccountID not available
+            # Method 2: Fallback to __finastra_account_id__ column if AccountID not available
             unmapped_mask = mapped_differentiators == ""
-            if unmapped_mask.any() and "account_id" in finastra_rows.columns:
+            if unmapped_mask.any() and "__finastra_account_id__" in finastra_rows.columns:
                 unmapped_rows = finastra_rows[unmapped_mask]
-                finastra_account_ids_fallback = unmapped_rows["account_id"].astype(str).str.replace(r"[^0-9]", "", regex=True)
+                finastra_account_ids_fallback = unmapped_rows["__finastra_account_id__"].astype(str).str.replace(r"[^0-9]", "", regex=True)
                 mapped_by_account_id_fallback = finastra_account_ids_fallback.map(account_id_to_name_map)
                 for idx in unmapped_rows.index:
                     if idx in mapped_by_account_id_fallback.index and mapped_by_account_id_fallback.loc[idx]:
@@ -2228,20 +2247,20 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
                         if account_id and account_id in account_id_to_name_map:
                             mapped_differentiators.loc[idx] = account_id_to_name_map[account_id]
             
-            # Method 4: Use __original_account_name__ directly as fallback
+            # Method 4: Use original_account_name directly as fallback (renamed from __original_account_name__)
             unmapped_mask = mapped_differentiators == ""
-            if unmapped_mask.any() and "__original_account_name__" in finastra_rows.columns:
+            if unmapped_mask.any() and "original_account_name" in finastra_rows.columns:
                 unmapped_rows = finastra_rows[unmapped_mask]
                 for idx in unmapped_rows.index:
-                    original_name = str(unmapped_rows.loc[idx, "__original_account_name__"]).strip()
+                    original_name = str(unmapped_rows.loc[idx, "original_account_name"]).strip()
                     if original_name and original_name.lower() != "nan":
                         mapped_differentiators.loc[idx] = original_name
             
             df.loc[finastra_mask, "differentiator"] = mapped_differentiators
         else:
-            # Fallback: use __original_account_name__ if available
-            if "__original_account_name__" in df.columns:
-                df.loc[finastra_mask, "differentiator"] = df.loc[finastra_mask, "__original_account_name__"].astype(str).str.strip()
+            # Fallback: use original_account_name if available (renamed from __original_account_name__)
+            if "original_account_name" in df.columns:
+                df.loc[finastra_mask, "differentiator"] = df.loc[finastra_mask, "original_account_name"].astype(str).str.strip()
         
         return df
     
@@ -2393,8 +2412,8 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
     # For Finastra customers, we need to group by customer_id + account_id (differentiator)
     # For other customers, group by customer_id only
     # First, identify Finastra customers
-    income_finastra_mask = income_df_with_customer["CustomerName"].astype(str).str.strip().str.lower() == "finastra"
-    lbpa_finastra_mask = lbpa_df_with_customer["CustomerName"].astype(str).str.strip().str.lower() == "finastra"
+    income_finastra_mask = income_df_with_customer["CustomerName"].astype(str).str.contains("finastra", case=False, na=False)
+    lbpa_finastra_mask = lbpa_df_with_customer["CustomerName"].astype(str).str.contains("finastra", case=False, na=False)
     
     # Create a grouping key: for Finastra use customer_id + account_id, for others just customer_id
     income_df_with_customer["__group_key__"] = income_df_with_customer["customer_id"]
@@ -2456,12 +2475,13 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
     
     # Create group_key in combined_internal for mapping
     combined_internal["__group_key__"] = combined_internal["customer_id"].astype(str)
-    finastra_mask = combined_internal["CustomerName"].astype(str).str.strip().str.lower() == "finastra"
-    if "account_id" in combined_internal.columns:
-        finastra_with_account = finastra_mask & combined_internal["account_id"].notna()
+    finastra_mask = combined_internal["CustomerName"].astype(str).str.contains("finastra", case=False, na=False)
+    # For Finastra, use __finastra_account_id__ instead of account_id (which is CustomerNumber)
+    if "__finastra_account_id__" in combined_internal.columns:
+        finastra_with_account = finastra_mask & combined_internal["__finastra_account_id__"].notna()
         combined_internal.loc[finastra_with_account, "__group_key__"] = (
             combined_internal.loc[finastra_with_account, "customer_id"].astype(str) + "_" +
-            combined_internal.loc[finastra_with_account, "account_id"].astype(str).str.replace(r"[^0-9]", "", regex=True)
+            combined_internal.loc[finastra_with_account, "__finastra_account_id__"].astype(str).str.replace(r"[^0-9]", "", regex=True)
         )
     
     # Map sums to all rows using group_key
@@ -2515,33 +2535,39 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
         )
         
         if finastra_rows_mask.any() and account_id_to_name:
-            # Fill in missing differentiators using account_id
+            # Fill in missing differentiators using __finastra_account_id__
             finastra_rows = combined_internal[finastra_rows_mask].copy()
-            if "account_id" in finastra_rows.columns:
-                finastra_account_ids = finastra_rows["account_id"].astype(str).str.replace(r"[^0-9]", "", regex=True)
+            if "__finastra_account_id__" in finastra_rows.columns:
+                finastra_account_ids = finastra_rows["__finastra_account_id__"].astype(str).str.replace(r"[^0-9]", "", regex=True)
                 mapped_differentiators = finastra_account_ids.map(account_id_to_name)
-                
-                # Fill in any unmapped ones using __original_account_name__ as fallback
-                unmapped_mask = mapped_differentiators.isna() | (mapped_differentiators == "")
-                if unmapped_mask.any() and "__original_account_name__" in finastra_rows.columns:
-                    unmapped_rows = finastra_rows[unmapped_mask]
-                    for idx in unmapped_rows.index:
-                        original_name = str(unmapped_rows.loc[idx, "__original_account_name__"]).strip()
-                        if original_name and original_name.lower() != "nan":
-                            mapped_differentiators.loc[idx] = original_name
-                
-                # Set differentiators for Finastra rows that don't have one
-                combined_internal.loc[finastra_rows_mask, "differentiator"] = mapped_differentiators.fillna("")
-            elif "__original_account_name__" in combined_internal.columns:
-                # Fallback: use __original_account_name__ if account_id not available
-                combined_internal.loc[finastra_rows_mask, "differentiator"] = (
-                    combined_internal.loc[finastra_rows_mask, "__original_account_name__"].astype(str)
-                )
+            elif "AccountID" in finastra_rows.columns:
+                # Fallback to AccountID column if __finastra_account_id__ not available
+                finastra_account_ids = finastra_rows["AccountID"].astype(str).str.replace(r"[^0-9]", "", regex=True)
+                mapped_differentiators = finastra_account_ids.map(account_id_to_name)
+            else:
+                mapped_differentiators = pd.Series(index=finastra_rows.index, dtype=str)
+            
+            # Fill in any unmapped ones using original_account_name as fallback (renamed from __original_account_name__)
+            unmapped_mask = mapped_differentiators.isna() | (mapped_differentiators == "")
+            if unmapped_mask.any() and "original_account_name" in finastra_rows.columns:
+                unmapped_rows = finastra_rows[unmapped_mask]
+                for idx in unmapped_rows.index:
+                    original_name = str(unmapped_rows.loc[idx, "original_account_name"]).strip()
+                    if original_name and original_name.lower() != "nan":
+                        mapped_differentiators.loc[idx] = original_name
+            
+            # Set differentiators for Finastra rows that don't have one
+            combined_internal.loc[finastra_rows_mask, "differentiator"] = mapped_differentiators.fillna("")
+        elif "original_account_name" in combined_internal.columns:
+            # Fallback: use original_account_name if account_id_to_name not available (renamed from __original_account_name__)
+            combined_internal.loc[finastra_rows_mask, "differentiator"] = (
+                combined_internal.loc[finastra_rows_mask, "original_account_name"].astype(str)
+            )
     
     # Set differentiator to empty for non-Finastra customers (only if not already set)
     non_finastra_mask = ~finastra_mask & (
         combined_internal["differentiator"].isna() | 
-        (combined_internal["differentiator"].astype(str).str.strip() != "")
+        (combined_internal["differentiator"].astype(str).str.strip() == "")
     )
     combined_internal.loc[non_finastra_mask, "differentiator"] = ""
     
@@ -3111,9 +3137,15 @@ def generate_split_csvs_with_all_columns(income_df, lbpa_df, usage_df):
     if len(combined_all) == 0:
         return results
     
-    # Remove helper columns before generating CSVs (drop all columns starting with "__")
-    helper_columns = [col for col in combined_all.columns if col.startswith("__")]
+    # Remove helper columns before generating CSVs (drop all columns starting with "__" except __original_account_name__ which we preserve)
+    helper_columns = [col for col in combined_all.columns if col.startswith("__") and col != "__original_account_name__"]
     columns_to_keep = [col for col in combined_all.columns if col not in helper_columns]
+    
+    # Rename __original_account_name__ to original_account_name to preserve it
+    if "__original_account_name__" in combined_all.columns:
+        combined_all = combined_all.rename(columns={"__original_account_name__": "original_account_name"})
+        if "original_account_name" not in columns_to_keep:
+            columns_to_keep.append("original_account_name")
     # Ensure customer_id is included
     if "customer_id" not in columns_to_keep:
         columns_to_keep.append("customer_id")

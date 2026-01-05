@@ -2568,6 +2568,7 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
     # Order/output columns to match Tabs expected headers
     upload_cols = [
         "customer_id",
+        "CustomerNumber",
         "CustomerName",
         "event_type_name",
         "datetime",
@@ -2811,7 +2812,62 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
     
     mapped_df = combined_internal[valid_customer_mask].copy()  # Use valid_customer_mask instead of ~unmapped_mask
     
+    # Rename account_id to CustomerNumber to match the actual source column (for all dataframes)
+    # Ensure CustomerNumber column exists in all dataframes
+    if "account_id" in mapped_df.columns:
+        mapped_df = mapped_df.rename(columns={"account_id": "CustomerNumber"})
+    elif "CustomerNumber" not in mapped_df.columns:
+        mapped_df["CustomerNumber"] = pd.NA
+    
+    if "account_id" in missing_customer_id_df.columns:
+        missing_customer_id_df = missing_customer_id_df.rename(columns={"account_id": "CustomerNumber"})
+    elif "CustomerNumber" not in missing_customer_id_df.columns:
+        missing_customer_id_df["CustomerNumber"] = pd.NA
+    
+    if "account_id" in unmapped_df.columns:
+        unmapped_df = unmapped_df.rename(columns={"account_id": "CustomerNumber"})
+    elif "CustomerNumber" not in unmapped_df.columns:
+        unmapped_df["CustomerNumber"] = pd.NA
+    
     combined = mapped_df[upload_cols].copy()
+    
+    # Ensure numeric
+    combined["IsInitialSubmission"] = pd.to_numeric(
+        combined["IsInitialSubmission"], errors="coerce"
+    ).fillna(0)
+    
+    combined["UnitsAsPerSubmission"] = pd.to_numeric(
+        combined["UnitsAsPerSubmission"], errors="coerce"
+    ).fillna(0)
+    
+    # Ensure Finastra rows preserve usage metrics
+    finastra_rows = combined["differentiator"].astype(str).str.strip() != ""
+    
+    combined.loc[
+        finastra_rows & combined["event_type_name"].str.lower().isin(["app", "lbpa app"]),
+        "IsInitialSubmission"
+    ] = combined.loc[
+        finastra_rows, "IsInitialSubmission"
+    ].fillna(0)
+    
+    combined.loc[
+        finastra_rows & combined["event_type_name"].str.lower().isin(["unit", "lbpa unit"]),
+        "UnitsAsPerSubmission"
+    ] = combined.loc[
+        finastra_rows, "UnitsAsPerSubmission"
+    ].fillna(0)
+    
+    # Assign value deterministically based on event type
+    combined.loc[
+        combined["event_type_name"].str.lower().isin(["app", "lbpa app"]),
+        "value"
+    ] = combined["IsInitialSubmission"]
+    
+    combined.loc[
+        combined["event_type_name"].str.lower().isin(["unit", "lbpa unit"]),
+        "value"
+    ] = combined["UnitsAsPerSubmission"]
+    
     unmapped_output = unmapped_df[upload_cols] if len(unmapped_df) > 0 else pd.DataFrame(columns=upload_cols)
     
     
@@ -2890,15 +2946,18 @@ def generate_split_csvs_with_all_columns(income_df, lbpa_df, usage_df):
     elif "AccountName" in usage_df.columns:
         usage_name_col = "AccountName"
     
-    # Get mappings from usage_df - account_id → customer_id only
+    # Get mappings from usage_df - CustomerNumber → customer_id only
     account_id_to_customer_id = {}
     # Also create reverse mapping: customer_id -> CustomerName (for filename)
     customer_id_to_name = {}
     
-    if "account_id" in usage_df.columns and "customer_id" in usage_df.columns:
-        # Create account_id -> customer_id mapping (like reference code uses UUID)
-        usage_acct_mapping = usage_df[["account_id", "customer_id"]].drop_duplicates()
-        usage_acct_mapping["__acct_key__"] = usage_acct_mapping["account_id"].astype(str).str.replace(r"[^0-9]", "", regex=True)
+    # Check for CustomerNumber column (renamed from account_id in usage CSV)
+    customer_number_col = "CustomerNumber" if "CustomerNumber" in usage_df.columns else ("account_id" if "account_id" in usage_df.columns else None)
+    
+    if customer_number_col and "customer_id" in usage_df.columns:
+        # Create CustomerNumber -> customer_id mapping (like reference code uses UUID)
+        usage_acct_mapping = usage_df[[customer_number_col, "customer_id"]].drop_duplicates()
+        usage_acct_mapping["__acct_key__"] = usage_acct_mapping[customer_number_col].astype(str).str.replace(r"[^0-9]", "", regex=True)
         account_id_to_customer_id = dict(zip(usage_acct_mapping["__acct_key__"], usage_acct_mapping["customer_id"]))
     
     if usage_name_col and "customer_id" in usage_df.columns:
@@ -2913,11 +2972,30 @@ def generate_split_csvs_with_all_columns(income_df, lbpa_df, usage_df):
         df.columns = df.columns.str.strip()
         
         # Find account_id column in original Income/LBPA file
-        acct_id_col = find_column(df, ["accountid", "acct#", "acct", "account number", "accountnumber"])
+        # Prefer CustomerNumber over AccountID since account_id represents CustomerNumber
+        acct_id_col = find_column(df, ["customernumber"])  # Try CustomerNumber first
+        if not acct_id_col:
+            acct_id_col = find_column(df, ["accountid", "acct#", "acct", "account number", "accountnumber"])
         
         # Only use account_id matching (usage_df is the single source of truth)
         if acct_id_col and account_id_to_customer_id:
-            df["__acct_key__"] = df[acct_id_col].astype(str).str.replace(r"[^0-9]", "", regex=True)
+            # If it's CustomerNumber, use extract_account_id_from_customer_number to handle floats
+            if acct_id_col.lower() == "customernumber":
+                def extract_id(val):
+                    if pd.isna(val):
+                        return ""
+                    try:
+                        float_val = float(val)
+                        int_val = int(float_val)
+                        return str(int_val)
+                    except (ValueError, TypeError):
+                        value_str = str(val).strip()
+                        if value_str.endswith('.0'):
+                            value_str = value_str[:-2]
+                        return re.sub(r"[^0-9]", "", value_str)
+                df["__acct_key__"] = df[acct_id_col].apply(extract_id)
+            else:
+                df["__acct_key__"] = df[acct_id_col].astype(str).str.replace(r"[^0-9]", "", regex=True)
             df["customer_id"] = df["__acct_key__"].map(account_id_to_customer_id)
         else:
             df["customer_id"] = None

@@ -237,11 +237,14 @@ def fetch_obligations_from_api(api_token=None, limit=1000, customer_id=None, pag
         limit: Maximum number of results per page
         customer_id: Optional customer ID to filter by (uses filter parameter)
         page: Optional page number for pagination
+    
+    Returns:
+        Tuple of (obligations list, pagination info dict with totalItems, currentPage) or (None, None) on error
     """
     if not api_token:
         api_token = API_KEY
     if not api_token:
-        return None
+        return None, None
     
     try:
         api_base_url = "https://integrators.prod.api.tabsplatform.com/v3"
@@ -267,13 +270,18 @@ def fetch_obligations_from_api(api_token=None, limit=1000, customer_id=None, pag
             data = response.json()
             if data.get("success") and "payload" in data:
                 obligations = data["payload"].get("data", [])
-                return obligations
-        return None
+                pagination_info = {
+                    "totalItems": data["payload"].get("totalItems", 0),
+                    "currentPage": data["payload"].get("currentPage", page or 1),
+                    "totalPages": data["payload"].get("totalPages", 1)
+                }
+                return obligations, pagination_info
+        return None, None
     except Exception as e:
-        return None
+        return None, None
 
 def fetch_contracts_from_api(api_token=None, limit=1000):
-    """Fetch contracts to map contractId to customerId"""
+    """Fetch contracts to map contractId to customerId with pagination"""
     if not api_token:
         api_token = API_KEY
     if not api_token:
@@ -287,17 +295,56 @@ def fetch_contracts_from_api(api_token=None, limit=1000):
             'Accept': 'application/json'
         }
         
-        url = f"{api_base_url}/contracts?limit={limit}"
-        response = requests.get(url, headers=headers, timeout=30)
+        all_contracts = []
+        page = 1
         
-        if response.status_code == 200:
+        while True:
+            url = f"{api_base_url}/contracts?limit={limit}&page={page}"
+            response = requests.get(url, headers=headers, timeout=30)
+            
+            if response.status_code != 200:
+                break
+                
             data = response.json()
-            if data.get("success") and "payload" in data:
-                contracts = data["payload"].get("data", [])
-                # Create mapping: contractId -> customerId
-                contract_to_customer = {c["id"]: c.get("customerId") for c in contracts if "id" in c and c.get("customerId")}
-                return contract_to_customer
-        return None
+            if not data.get("success") or "payload" not in data:
+                break
+                
+            contracts = data["payload"].get("data", [])
+            if not contracts:
+                break
+                
+            all_contracts.extend(contracts)
+            
+            # Check if there are more pages
+            payload = data["payload"]
+            total_items = payload.get("totalItems", 0)
+            current_page = payload.get("currentPage", page)
+            total_pages = payload.get("totalPages", 1)
+            
+            # Check if we've fetched all items (more reliable than totalPages)
+            if total_items > 0 and len(all_contracts) >= total_items:
+                break
+            
+            # Also check if we got fewer than the limit (last page)
+            if len(contracts) < limit:
+                break
+            
+            # If totalPages seems wrong (we have more items than one page can hold), continue fetching
+            if total_pages == 1 and total_items > limit:
+                # Continue to next page
+                pass
+            elif current_page >= total_pages:
+                break
+                
+            page += 1
+            
+            # Safety check
+            if page > 100:
+                break
+        
+        # Create mapping: contractId -> customerId (normalize customerId to string)
+        contract_to_customer = {c["id"]: str(c.get("customerId")).strip() for c in all_contracts if "id" in c and c.get("customerId")}
+        return contract_to_customer
     except Exception as e:
         return None
 
@@ -323,14 +370,19 @@ def build_customer_event_type_mapping(customer_ids, api_token=None, use_obligati
     if not event_type_mapping:
         return {}
     
+    # Normalize customer IDs to strings for comparison
+    customer_ids_list = [str(cid).strip() for cid in customer_ids] if customer_ids else []
+    customer_ids_set = set(customer_ids_list) if customer_ids_list else None
+    
+    # Fetch all obligations and contracts with pagination (efficient bulk approach)
+    all_obligations = []
+    
     # Step 1.5: Fetch contracts to map contractId -> customerId (obligations have contractId, not customerId)
     contract_to_customer = fetch_contracts_from_api(api_token)
     if not contract_to_customer:
         contract_to_customer = {}
     
     # Step 2: Fetch ALL obligations once (with pagination if needed)
-    # This is much more efficient than calling the API for each customer
-    all_obligations = []
     page = 1
     limit = 1000
     
@@ -338,9 +390,10 @@ def build_customer_event_type_mapping(customer_ids, api_token=None, use_obligati
     status_text = st.empty()
     
     try:
+        total_items = None
         while True:
             status_text.text(f"Fetching obligations page {page}...")
-            obligations = fetch_obligations_from_api(api_token, limit=limit, page=page)
+            obligations, pagination_info = fetch_obligations_from_api(api_token, limit=limit, page=page)
             
             if not obligations:
                 if page == 1:
@@ -350,9 +403,30 @@ def build_customer_event_type_mapping(customer_ids, api_token=None, use_obligati
             
             all_obligations.extend(obligations)
             
-            # Check if we got fewer than the limit (last page)
-            if len(obligations) < limit:
-                break
+            # Use pagination info if available
+            if pagination_info:
+                total_items = pagination_info.get("totalItems", 0)
+                current_page = pagination_info.get("currentPage", page)
+                total_pages = pagination_info.get("totalPages", 1)
+                
+                # Check if we've fetched all items (more reliable than totalPages which can be wrong)
+                if total_items > 0 and len(all_obligations) >= total_items:
+                    break
+                
+                # Also check if we got fewer than the limit (last page)
+                if len(obligations) < limit:
+                    break
+                
+                # If totalPages seems wrong (we have more items than one page can hold), continue fetching
+                if total_pages == 1 and total_items > limit:
+                    # Continue to next page
+                    pass
+                elif current_page >= total_pages:
+                    break
+            else:
+                # Fallback: check if we got fewer than the limit (last page)
+                if len(obligations) < limit:
+                    break
             
             page += 1
             
@@ -362,7 +436,10 @@ def build_customer_event_type_mapping(customer_ids, api_token=None, use_obligati
                 break
             
             # Update progress
-            progress_bar.progress(min(page / 50, 1.0))
+            if total_items:
+                progress_bar.progress(min(len(all_obligations) / total_items, 1.0))
+            else:
+                progress_bar.progress(min(page / 50, 1.0))
     except Exception as e:
         st.error(f"❌ Error fetching obligations: {str(e)}")
         progress_bar.empty()
@@ -373,37 +450,73 @@ def build_customer_event_type_mapping(customer_ids, api_token=None, use_obligati
         status_text.empty()
     
     if not all_obligations:
+        st.warning("⚠️ No obligations found in API")
         return {}
     
     # Step 3: Group obligations by customer_id and extract event types
     customer_to_event_types = {}
-    customer_ids_set = set(customer_ids) if customer_ids else None
+    obligations_without_contract = 0
+    obligations_without_customer = 0
+    obligations_without_billing = 0
+    obligations_without_event_type = 0
+    obligations_filtered_out = 0
+    
+    # Create a normalized lookup set for flexible matching
+    # Store both original and normalized versions
+    customer_ids_normalized = {}
+    for cid in customer_ids_set:
+        normalized = str(cid).strip().lower()
+        customer_ids_normalized[normalized] = cid
     
     for obligation in all_obligations:
-        # Obligations have contractId, not customerId directly
-        # We need to map contractId -> customerId using the contracts we fetched
-        contract_id = obligation.get("contractId") or obligation.get("contract_id") or obligation.get("ContractId")
-        if not contract_id:
-            continue
+        # Try direct customerId field first
+        customer_id = obligation.get("customerId") or obligation.get("customer_id") or obligation.get("CustomerId")
         
-        # Map contractId to customerId
-        customer_id = contract_to_customer.get(contract_id)
+        # Debug: check if this obligation might be for our customer (before contract mapping)
+        contract_id = obligation.get("contractId") or obligation.get("contract_id") or obligation.get("ContractId")
+        
+        # If no direct customerId, try mapping via contractId
         if not customer_id:
-            # Try direct customerId field as fallback (in case some obligations have it)
-            customer_id = obligation.get("customerId") or obligation.get("customer_id") or obligation.get("CustomerId")
+            if not contract_id:
+                obligations_without_contract += 1
+                continue
+            
+            # Map contractId to customerId
+            customer_id = contract_to_customer.get(contract_id)
             if not customer_id:
+                obligations_without_customer += 1
                 continue
         
-        # If we have a specific list of customer_ids, only process those
-        if customer_ids_set and customer_id not in customer_ids_set:
+        # Normalize customer_id to string for comparison
+        customer_id_normalized = str(customer_id).strip()
+        
+        # Try to match customer_id - check normalized (case-insensitive) match
+        matched_customer_id = None
+        if customer_ids_set:
+            # Try exact match first
+            if customer_id_normalized in customer_ids_set:
+                matched_customer_id = customer_id_normalized
+            else:
+                # Try case-insensitive match
+                customer_id_lower = customer_id_normalized.lower()
+                if customer_id_lower in customer_ids_normalized:
+                    matched_customer_id = customer_ids_normalized[customer_id_lower]
+        
+        if not matched_customer_id and customer_ids_set:
+            obligations_filtered_out += 1
             continue
+        
+        # Use the matched customer_id (or original if no filtering)
+        customer_id = matched_customer_id if matched_customer_id else customer_id_normalized
         
         billing_schedule = obligation.get("billingSchedule", {})
         if not billing_schedule:
+            obligations_without_billing += 1
             continue
             
         event_type_id = billing_schedule.get("eventTypeId")
         if not event_type_id:
+            obligations_without_event_type += 1
             continue
         
         if event_type_id not in event_type_mapping:
@@ -418,7 +531,22 @@ def build_customer_event_type_mapping(customer_ids, api_token=None, use_obligati
             customer_to_event_types[customer_id].append(event_type_name)
     
     if not customer_to_event_types:
-        st.warning("⚠️ No customer event type mappings created from obligations")
+        debug_info = []
+        if obligations_without_contract > 0:
+            debug_info.append(f"{obligations_without_contract} without contractId")
+        if obligations_without_customer > 0:
+            debug_info.append(f"{obligations_without_customer} couldn't map to customer")
+        if obligations_without_billing > 0:
+            debug_info.append(f"{obligations_without_billing} without billingSchedule")
+        if obligations_without_event_type > 0:
+            debug_info.append(f"{obligations_without_event_type} without eventTypeId")
+        if obligations_filtered_out > 0:
+            debug_info.append(f"{obligations_filtered_out} filtered out (not in customer list)")
+        
+        debug_msg = f"⚠️ No customer event type mappings created from obligations"
+        if debug_info:
+            debug_msg += f" ({', '.join(debug_info)})"
+        st.warning(debug_msg)
     
     return customer_to_event_types
 
@@ -3070,12 +3198,21 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
                             if correction_info["income"]:
                                 correct_event_type = correction_info["income"]
                             elif correction_info["has_app"] and correction_info["has_unit"]:
-                                # Customer has both - keep current if it's valid
+                                # Customer has both - check data to determine which one to use
+                                units_value = row.get("UnitsAsPerSubmission", 0)
+                                app_value = row.get("IsInitialSubmission", 0)
+                                
+                                # If current event type is valid, keep it
                                 if current_event_type.lower() in ["app", "unit"]:
                                     correct_event_type = current_event_type
-                                else:
-                                    # Default to app if current is invalid
+                                # Otherwise, prefer unit if UnitsAsPerSubmission > 0, otherwise prefer unit over app
+                                elif units_value and units_value > 0:
+                                    correct_event_type = "unit"
+                                elif app_value and app_value > 0:
                                     correct_event_type = "app"
+                                else:
+                                    # Default to unit when both are available (unit is more common)
+                                    correct_event_type = "unit"
                             else:
                                 # Customer has neither - mark as unmatched
                                 correct_event_type = None
@@ -3085,12 +3222,21 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
                             if correction_info["lbpa"]:
                                 correct_event_type = correction_info["lbpa"]
                             elif correction_info["has_lbpa_app"] and correction_info["has_lbpa_unit"]:
-                                # Customer has both - keep current if it's valid
+                                # Customer has both - check data to determine which one to use
+                                units_value = row.get("UnitsAsPerSubmission", 0)
+                                app_value = row.get("IsInitialSubmission", 0)
+                                
+                                # If current event type is valid, keep it
                                 if current_event_type.lower() in ["lbpa app", "lbpa unit"]:
                                     correct_event_type = current_event_type
-                                else:
-                                    # Default to LBPA app if current is invalid
+                                # Otherwise, prefer LBPA unit if UnitsAsPerSubmission > 0
+                                elif units_value and units_value > 0:
+                                    correct_event_type = "LBPA unit"
+                                elif app_value and app_value > 0:
                                     correct_event_type = "LBPA app"
+                                else:
+                                    # Default to LBPA unit when both are available
+                                    correct_event_type = "LBPA unit"
                             else:
                                 # Customer has neither - mark as unmatched
                                 correct_event_type = None
@@ -3233,6 +3379,7 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
                 customer_id = row["customer_id"]
                 differentiator = row.get("differentiator", "")
                 application_type = row.get("ApplicationTypeName", "")
+                current_event_type_before = row.get("event_type_name", "")
                 
                 # Find matching rows in mapped_df
                 if differentiator:
@@ -3249,8 +3396,19 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
                     combined.loc[idx, "IsInitialSubmission"] = first_row.get("IsInitialSubmission", 0)
                 
                 # Set event_type_name directly from what customer has in obligations
+                # Try both direct lookup and string comparison
+                customer_event_types_key = None
                 if customer_id in customer_event_types:
-                    valid_event_types = customer_event_types[customer_id]
+                    customer_event_types_key = customer_id
+                else:
+                    # Try string matching
+                    for cid in customer_event_types.keys():
+                        if str(cid).strip() == str(customer_id).strip():
+                            customer_event_types_key = cid
+                            break
+                
+                if customer_event_types_key:
+                    valid_event_types = customer_event_types[customer_event_types_key]
                     # Map API event types to standard names
                     customer_standard_types = set()
                     for et in valid_event_types:
@@ -3258,7 +3416,7 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
                         if et_lower in api_to_standard_map:
                             customer_standard_types.add(api_to_standard_map[et_lower])
                     
-                    # For Income: use what's in the original data if it matches obligations
+                    # For Income: prioritize what customer has in obligations
                     # Standard event types: "app" or "unit"
                     if application_type == "Income":
                         # Check what event type is in the original data
@@ -3270,22 +3428,29 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
                         has_app_in_data = "app" in original_event_types
                         has_unit_in_data = "unit" in original_event_types
                         
-                        # Use what's in the original data if it matches what customer has in obligations
-                        if has_unit_in_data and "unit" in customer_standard_types:
-                            # Original data has "unit" and customer has "unit" in obligations - use "unit"
+                        # Prioritize what customer has in obligations over original data
+                        has_app_in_obligations = "app" in customer_standard_types
+                        has_unit_in_obligations = "unit" in customer_standard_types
+                        
+                        # If customer only has one option in obligations, use it regardless of original data
+                        if has_unit_in_obligations and not has_app_in_obligations:
+                            # Customer only has "unit" - use "unit"
                             combined.loc[idx, "event_type_name"] = "unit"
-                        elif has_app_in_data and "app" in customer_standard_types:
-                            # Original data has "app" and customer has "app" in obligations - use "app"
+                        elif has_app_in_obligations and not has_unit_in_obligations:
+                            # Customer only has "app" - use "app"
                             combined.loc[idx, "event_type_name"] = "app"
-                        elif "unit" in customer_standard_types:
-                            # Customer has "unit" in obligations but data doesn't match - use "unit"
-                            combined.loc[idx, "event_type_name"] = "unit"
-                        elif "app" in customer_standard_types:
-                            # Customer has "app" in obligations but data doesn't match - use "app"
-                            combined.loc[idx, "event_type_name"] = "app"
+                        elif has_unit_in_obligations and has_app_in_obligations:
+                            # Customer has both - use what's in original data if it matches
+                            if has_unit_in_data and "unit" in customer_standard_types:
+                                combined.loc[idx, "event_type_name"] = "unit"
+                            elif has_app_in_data and "app" in customer_standard_types:
+                                combined.loc[idx, "event_type_name"] = "app"
+                            else:
+                                # Default to unit when both are available
+                                combined.loc[idx, "event_type_name"] = "unit"
                         # else: Customer has neither - keep current
                     
-                    # For LBPA: use what's in the original data if it matches obligations
+                    # For LBPA: prioritize what customer has in obligations
                     # Standard event types: "LBPA app" or "LBPA unit"
                     elif application_type == "LBPA":
                         # Check what event type is in the original data
@@ -3297,19 +3462,26 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
                         has_lbpa_app_in_data = "LBPA app" in original_event_types
                         has_lbpa_unit_in_data = "LBPA unit" in original_event_types
                         
-                        # Use what's in the original data if it matches what customer has in obligations
-                        if has_lbpa_unit_in_data and "LBPA unit" in customer_standard_types:
-                            # Original data has "LBPA unit" and customer has "LBPA unit" in obligations - use "LBPA unit"
+                        # Prioritize what customer has in obligations over original data
+                        has_lbpa_app_in_obligations = "LBPA app" in customer_standard_types
+                        has_lbpa_unit_in_obligations = "LBPA unit" in customer_standard_types
+                        
+                        # If customer only has one option in obligations, use it regardless of original data
+                        if has_lbpa_unit_in_obligations and not has_lbpa_app_in_obligations:
+                            # Customer only has "LBPA unit" - use "LBPA unit"
                             combined.loc[idx, "event_type_name"] = "LBPA unit"
-                        elif has_lbpa_app_in_data and "LBPA app" in customer_standard_types:
-                            # Original data has "LBPA app" and customer has "LBPA app" in obligations - use "LBPA app"
+                        elif has_lbpa_app_in_obligations and not has_lbpa_unit_in_obligations:
+                            # Customer only has "LBPA app" - use "LBPA app"
                             combined.loc[idx, "event_type_name"] = "LBPA app"
-                        elif "LBPA unit" in customer_standard_types:
-                            # Customer has "LBPA unit" in obligations but data doesn't match - use "LBPA unit"
-                            combined.loc[idx, "event_type_name"] = "LBPA unit"
-                        elif "LBPA app" in customer_standard_types:
-                            # Customer has "LBPA app" in obligations but data doesn't match - use "LBPA app"
-                            combined.loc[idx, "event_type_name"] = "LBPA app"
+                        elif has_lbpa_unit_in_obligations and has_lbpa_app_in_obligations:
+                            # Customer has both - use what's in original data if it matches
+                            if has_lbpa_unit_in_data and "LBPA unit" in customer_standard_types:
+                                combined.loc[idx, "event_type_name"] = "LBPA unit"
+                            elif has_lbpa_app_in_data and "LBPA app" in customer_standard_types:
+                                combined.loc[idx, "event_type_name"] = "LBPA app"
+                            else:
+                                # Default to LBPA unit when both are available
+                                combined.loc[idx, "event_type_name"] = "LBPA unit"
                         # If neither, keep current (shouldn't happen)
         
         # Set value based on event_type_name:
@@ -3524,7 +3696,6 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
     # Set AccountIDs for customers using mappings from income/LBPA files
     # Use the customer_account_mappings we built from income/LBPA files
     if uploaded_customer and get_api_key() and customer_account_mappings:
-        st.write("🔧 Setting AccountIDs for customers from income/LBPA files...")
         try:
             # Reset file pointer to beginning if it's been read before
             if hasattr(uploaded_customer, 'seek'):
@@ -3541,7 +3712,6 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
                 updated_customers = []
                 total_customers = len(customer_df_sync)
                 
-                st.write(f"   Processing {total_customers} customers from customer file...")
                 
                 for i, row in customer_df_sync.iterrows():
                     customer_id = str(row["ID"]).strip()
@@ -3583,8 +3753,6 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
                         st.write(f"   Updated customers: {', '.join(customer_list)}")
                         if len(updated_customers) > 20:
                             st.write(f"   ... and {len(updated_customers) - 20} more")
-                if skipped_count > 0:
-                    st.write(f"   ℹ️ Skipped {skipped_count} customers that already have AccountID in customer file")
                 if error_count > 0:
                     st.write(f"   ⚠️ Failed to update {error_count} customers")
         except Exception as e:
@@ -3597,7 +3765,8 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
     # These customers are already in the customer file but their "Customer Number" column is empty
     # Find them by name in TABS (only "- NMS" customers) and set their AccountID
     # Only set AccountID if customer doesn't already have it in customer file
-    if get_api_key() and account_ids_without_customer_id:
+    # DISABLED: Not using TABS customer search API
+    if False and get_api_key() and account_ids_without_customer_id:
         st.write(f"🔍 Searching TABS for {len(account_ids_without_customer_id)} AccountIDs that couldn't be mapped...")
         
         # Build name to AccountID mapping from unmapped rows
@@ -4064,6 +4233,10 @@ with usage_tab:
     )
     # Use provided API key or fall back to environment/secrets
     event_validation_api_key = api_key_input if api_key_input else API_KEY
+    
+    # Store API key in session state so get_api_key() can find it
+    if event_validation_api_key:
+        st.session_state["ui_api_key_usage"] = event_validation_api_key
 
     if st.button("Generate Usage CSV"):
         up = st.session_state.get("uploaded_files", {})
@@ -4114,13 +4287,6 @@ with usage_tab:
             except Exception as e:
                 st.error(f"Could not preview Usage CSV: {e}")
         
-        st.download_button(
-            "Download Usage CSV",
-            data=st.session_state["generated_files"]["usage_combined"]["bytes"],
-            file_name=st.session_state["generated_files"]["usage_combined"]["name"],
-            key="dl_usage_latest",
-        )
-        
         # Show missing customer_id CSV download if any missing customer_id rows exist
         if st.session_state.get("generated_files", {}).get("usage_missing_customer_id"):
             missing_customer_id_count = st.session_state.get("missing_customer_id_count", 0)
@@ -4133,13 +4299,6 @@ with usage_tab:
                 with st.expander("Missing Customer ID Rows Preview", expanded=False):
                     st.caption(f"Rows: {len(missing_customer_id_df):,} | Columns: {len(missing_customer_id_df.columns)}")
                     st.dataframe(missing_customer_id_df, use_container_width=True)
-            
-            st.download_button(
-                "Download Missing Customer ID CSV",
-                data=st.session_state["generated_files"]["usage_missing_customer_id"]["bytes"],
-                file_name=st.session_state["generated_files"]["usage_missing_customer_id"]["name"],
-                key="dl_missing_customer_id_latest",
-            )
         
         # Show unmapped CSV download if any unmapped rows exist (subset of missing customer_id)
         if st.session_state.get("generated_files", {}).get("usage_unmapped"):

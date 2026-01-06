@@ -480,10 +480,10 @@ def build_customer_event_type_mapping(customer_ids, api_token=None, use_obligati
             if not contract_id:
                 obligations_without_contract += 1
                 continue
-            
-            # Map contractId to customerId
-            customer_id = contract_to_customer.get(contract_id)
-            if not customer_id:
+        
+        # Map contractId to customerId
+        customer_id = contract_to_customer.get(contract_id)
+        if not customer_id:
                 obligations_without_customer += 1
                 continue
         
@@ -687,13 +687,39 @@ def fetch_all_invoices_for_cache(api_token):
         progress_bar = st.progress(0)
         status_text = st.empty()
         
+        # Retry configuration
+        max_retries = 3
+        retry_delay = 2  # seconds
+        
         while True:
             params = {
                 'limit': limit,
                 'page': page
             }
             
-            response = requests.get(url, headers=headers, params=params, timeout=30)
+            # Retry logic for timeout errors
+            retry_count = 0
+            response = None
+            while retry_count < max_retries:
+                try:
+                    # Use longer timeout: (connect_timeout, read_timeout)
+                    # 60 seconds for connection, 120 seconds for read
+                    response = requests.get(url, headers=headers, params=params, timeout=(60, 120))
+                    break  # Success, exit retry loop
+                except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectTimeout, requests.exceptions.Timeout) as e:
+                    retry_count += 1
+                    if retry_count < max_retries:
+                        status_text.text(f"⏳ Timeout on page {page}, retrying ({retry_count}/{max_retries})...")
+                        import time
+                        time.sleep(retry_delay)
+                    else:
+                        # Final retry failed
+                        st.error(f"❌ Request timed out after {max_retries} attempts on page {page}")
+                        st.warning("💡 This may be due to network issues or the API being slow. Please try again later.")
+                        raise
+                except requests.exceptions.RequestException as e:
+                    # Other request errors - don't retry
+                    raise
             
             if response.status_code == 200:
                 data = response.json()
@@ -763,8 +789,20 @@ def fetch_all_invoices_for_cache(api_token):
             st.error("❌ No invoices fetched")
             return None
             
+    except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectTimeout, requests.exceptions.Timeout) as e:
+        st.error(f"❌ Request timed out: {str(e)}")
+        st.warning("💡 The API request took too long. This may be due to:")
+        st.warning("   • Network connectivity issues")
+        st.warning("   • API server being slow or overloaded")
+        st.warning("   • Large number of invoices to fetch")
+        st.info("💡 Please try again later, or contact support if the issue persists.")
+        return None
+    except requests.exceptions.RequestException as e:
+        st.error(f"❌ Network error: {str(e)}")
+        st.warning("💡 Please check your internet connection and try again.")
+        return None
     except Exception as e:
-        st.error(f"Failed to fetch invoices: {str(e)}")
+        st.error(f"❌ Failed to fetch invoices: {str(e)}")
         import traceback
         st.code(traceback.format_exc())
         return None
@@ -1942,14 +1980,15 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
         # account_id always represents CustomerNumber (__acct_key__)
         grouped["account_id"] = grouped["__acct_key__"] if "__acct_key__" in grouped.columns else pd.NA
         
-        # Store Finastra AccountID in separate column (from __group_key__ when it's Finastra)
+        # Store Finastra AccountID in separate column (from AccountID column when it's Finastra)
         grouped["__finastra_account_id__"] = pd.NA
-        if finastra_mask.any() and "__group_key__" in grouped.columns:
-            # For Finastra rows, __group_key__ contains AccountID (normalized numeric string)
-            # Map back to grouped dataframe to identify Finastra rows
-            grouped_finastra_mask = grouped["AccountName"].astype(str).str.contains("Finastra", case=False, na=False)
-            if grouped_finastra_mask.any():
-                grouped.loc[grouped_finastra_mask, "__finastra_account_id__"] = grouped.loc[grouped_finastra_mask, "__group_key__"]
+        # Check for Finastra rows in grouped dataframe directly
+        grouped_finastra_mask = grouped["AccountName"].astype(str).str.contains("Finastra", case=False, na=False)
+        if "AccountID" in grouped.columns and grouped_finastra_mask.any():
+            # Extract AccountID as normalized numeric string (matching the format used in aggregation)
+            grouped.loc[grouped_finastra_mask, "__finastra_account_id__"] = (
+                grouped.loc[grouped_finastra_mask, "AccountID"].astype(str).str.replace(r"[^0-9]", "", regex=True)
+            )
         
         # Include __original_account_name__ in return if it exists
         return_cols = ["customer_id", "AccountName", "event_type_name", "datetime", "value", "differentiator", "account_id"]
@@ -2179,9 +2218,9 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
             # For common keys, remove from units (keep the "app" row)
             income_upload_units_filtered = income_upload_units_filtered[~income_upload_units_filtered["__match_key__"].isin(common_keys)]
         
-        # Remove helper columns (all columns starting with "__" except __original_account_name__ which we preserve)
-        helper_cols_apps = [col for col in income_upload_apps_filtered.columns if col.startswith("__") and col != "__original_account_name__"]
-        helper_cols_units = [col for col in income_upload_units_filtered.columns if col.startswith("__") and col != "__original_account_name__"]
+        # Remove helper columns (all columns starting with "__" except __original_account_name__ and __finastra_account_id__ which we preserve)
+        helper_cols_apps = [col for col in income_upload_apps_filtered.columns if col.startswith("__") and col not in ["__original_account_name__", "__finastra_account_id__"]]
+        helper_cols_units = [col for col in income_upload_units_filtered.columns if col.startswith("__") and col not in ["__original_account_name__", "__finastra_account_id__"]]
         if helper_cols_apps:
             income_upload_apps_filtered = income_upload_apps_filtered.drop(columns=helper_cols_apps, errors="ignore")
         if helper_cols_units:
@@ -2389,11 +2428,12 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
     income_finastra_mask = income_df_with_customer["CustomerName"].astype(str).str.contains("finastra", case=False, na=False)
     lbpa_finastra_mask = lbpa_df_with_customer["CustomerName"].astype(str).str.contains("finastra", case=False, na=False)
     
-    # Create a grouping key: for Finastra use customer_id + account_id, for others just customer_id
+    # Create a grouping key: for Finastra use customer_id + AccountID (since CustomerNumber is same for all), for others just customer_id
     income_df_with_customer["__group_key__"] = income_df_with_customer["customer_id"]
     if "AccountID" in income_df_with_customer.columns:
         income_finastra_rows = income_df_with_customer[income_finastra_mask & income_valid_mask]
         if len(income_finastra_rows) > 0:
+            # For Finastra, use customer_id + AccountID (AccountID distinguishes differentiators)
             income_df_with_customer.loc[income_finastra_mask & income_valid_mask, "__group_key__"] = (
                 income_df_with_customer.loc[income_finastra_mask & income_valid_mask, "customer_id"].astype(str) + "_" +
                 income_df_with_customer.loc[income_finastra_mask & income_valid_mask, "AccountID"].astype(str).str.replace(r"[^0-9]", "", regex=True)
@@ -2403,6 +2443,7 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
     if "AccountID" in lbpa_df_with_customer.columns:
         lbpa_finastra_rows = lbpa_df_with_customer[lbpa_finastra_mask & lbpa_valid_mask]
         if len(lbpa_finastra_rows) > 0:
+            # For Finastra, use customer_id + AccountID (AccountID distinguishes differentiators)
             lbpa_df_with_customer.loc[lbpa_finastra_mask & lbpa_valid_mask, "__group_key__"] = (
                 lbpa_df_with_customer.loc[lbpa_finastra_mask & lbpa_valid_mask, "customer_id"].astype(str) + "_" +
                 lbpa_df_with_customer.loc[lbpa_finastra_mask & lbpa_valid_mask, "AccountID"].astype(str).str.replace(r"[^0-9]", "", regex=True)
@@ -2450,9 +2491,11 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
     # Create group_key in combined_internal for mapping
     combined_internal["__group_key__"] = combined_internal["customer_id"].astype(str)
     finastra_mask = combined_internal["CustomerName"].astype(str).str.contains("finastra", case=False, na=False)
-    # For Finastra, use __finastra_account_id__ instead of account_id (which is CustomerNumber)
+    
+    # For Finastra, use customer_id + __finastra_account_id__ (matching Income/LBPA format: customer_id + AccountID)
     if "__finastra_account_id__" in combined_internal.columns:
         finastra_with_account = finastra_mask & combined_internal["__finastra_account_id__"].notna()
+        # Use customer_id + AccountID format (matching Income/LBPA aggregation)
         combined_internal.loc[finastra_with_account, "__group_key__"] = (
             combined_internal.loc[finastra_with_account, "customer_id"].astype(str) + "_" +
             combined_internal.loc[finastra_with_account, "__finastra_account_id__"].astype(str).str.replace(r"[^0-9]", "", regex=True)
@@ -2518,7 +2561,7 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
                 # If __finastra_account_id__ is missing, leave differentiator empty
                 mapped_differentiators = pd.Series(index=finastra_rows.index, dtype=str)
                 mapped_differentiators[:] = ""
-            
+                
             # Fill in any unmapped ones using original_account_name as fallback (renamed from __original_account_name__)
             unmapped_mask = mapped_differentiators.isna() | (mapped_differentiators == "")
             if unmapped_mask.any() and "original_account_name" in finastra_rows.columns:
@@ -2831,7 +2874,17 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
     
     combined = mapped_df[upload_cols].copy()
     
-    # Ensure numeric
+    # Identify Finastra rows BEFORE converting to numeric
+    finastra_rows = combined["differentiator"].astype(str).str.strip() != ""
+    
+    # Store original Finastra values BEFORE numeric conversion
+    finastra_is_initial = None
+    finastra_units = None
+    if finastra_rows.any():
+        finastra_is_initial = combined.loc[finastra_rows, "IsInitialSubmission"].copy()
+        finastra_units = combined.loc[finastra_rows, "UnitsAsPerSubmission"].copy()
+    
+    # Ensure numeric (this may convert some values to NaN or 0)
     combined["IsInitialSubmission"] = pd.to_numeric(
         combined["IsInitialSubmission"], errors="coerce"
     ).fillna(0)
@@ -2840,22 +2893,35 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
         combined["UnitsAsPerSubmission"], errors="coerce"
     ).fillna(0)
     
-    # Ensure Finastra rows preserve usage metrics
-    finastra_rows = combined["differentiator"].astype(str).str.strip() != ""
-    
-    combined.loc[
-        finastra_rows & combined["event_type_name"].str.lower().isin(["app", "lbpa app"]),
-        "IsInitialSubmission"
-    ] = combined.loc[
-        finastra_rows, "IsInitialSubmission"
-    ].fillna(0)
-    
-    combined.loc[
-        finastra_rows & combined["event_type_name"].str.lower().isin(["unit", "lbpa unit"]),
-        "UnitsAsPerSubmission"
-    ] = combined.loc[
-        finastra_rows, "UnitsAsPerSubmission"
-    ].fillna(0)
+    # Restore original Finastra values (preserve the actual values, not fillna(0))
+    if finastra_rows.any() and finastra_is_initial is not None:
+        # Convert original values to numeric but preserve the actual values
+        finastra_is_initial_numeric = pd.to_numeric(finastra_is_initial, errors="coerce")
+        finastra_units_numeric = pd.to_numeric(finastra_units, errors="coerce")
+        
+        # Restore values for app events - use the stored indices directly
+        app_mask = finastra_rows & combined["event_type_name"].str.lower().isin(["app", "lbpa app"])
+        if app_mask.any():
+            # finastra_is_initial_numeric has indices from finastra_rows, so we can use them directly
+            app_indices = combined.index[app_mask]
+            # Get matching values using reindex to align indices
+            matching_app_values = finastra_is_initial_numeric.reindex(app_indices)
+            # Only restore non-zero values (preserve original non-zero values, don't overwrite with 0)
+            non_zero_mask = matching_app_values.notna() & (matching_app_values != 0)
+            if non_zero_mask.any():
+                combined.loc[app_indices[non_zero_mask], "IsInitialSubmission"] = matching_app_values[non_zero_mask]
+        
+        # Restore values for unit events - use the stored indices directly
+        unit_mask = finastra_rows & combined["event_type_name"].str.lower().isin(["unit", "lbpa unit"])
+        if unit_mask.any():
+            # finastra_units_numeric has indices from finastra_rows, so we can use them directly
+            unit_indices = combined.index[unit_mask]
+            # Get matching values using reindex to align indices
+            matching_unit_values = finastra_units_numeric.reindex(unit_indices)
+            # Only restore non-zero values (preserve original non-zero values, don't overwrite with 0)
+            non_zero_mask = matching_unit_values.notna() & (matching_unit_values != 0)
+            if non_zero_mask.any():
+                combined.loc[unit_indices[non_zero_mask], "UnitsAsPerSubmission"] = matching_unit_values[non_zero_mask]
     
     # Assign value deterministically based on event type
     combined.loc[
@@ -2926,7 +2992,7 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
     # Store original dataframes for later split CSV generation with all columns
     st.session_state["original_income_df"] = income_df.copy()
     st.session_state["original_lbpa_df"] = lbpa_df.copy()
-
+    
     return income_upload, lbpa_df, combined_csv_bytes, combined_internal_csv_bytes
 
 
@@ -3014,8 +3080,8 @@ def generate_split_csvs_with_all_columns(income_df, lbpa_df, usage_df):
     if len(combined_all) == 0:
         return results
     
-    # Remove helper columns before generating CSVs (drop all columns starting with "__" except __original_account_name__ which we preserve)
-    helper_columns = [col for col in combined_all.columns if col.startswith("__") and col != "__original_account_name__"]
+    # Remove helper columns before generating CSVs (drop all columns starting with "__" except __original_account_name__ and __finastra_account_id__ which we preserve)
+    helper_columns = [col for col in combined_all.columns if col.startswith("__") and col not in ["__original_account_name__", "__finastra_account_id__"]]
     columns_to_keep = [col for col in combined_all.columns if col not in helper_columns]
     
     # Rename __original_account_name__ to original_account_name to preserve it
@@ -3658,75 +3724,54 @@ with chunk_tab:
                     st.info("✅ Cache is fresh and up-to-date.")
             
             st.markdown("---")
-            
-            # Option to upload mapping CSV (takes priority over generated mapping)
-            uploaded_mapping = st.file_uploader("Upload Invoice Mapping CSV (optional)", type=["csv"], key="upload_mapping_csv")
-            
-            if uploaded_mapping is not None:
+        
+        # Option to upload mapping CSV (takes priority over generated mapping)
+        uploaded_mapping = st.file_uploader("Upload Invoice Mapping CSV (optional)", type=["csv"], key="upload_mapping_csv")
+        
+        if uploaded_mapping is not None:
                 # User uploaded a CSV - use it instead of generating mapping
-                try:
-                    mapping_df = pd.read_csv(uploaded_mapping)
-                    required_cols = ["split_csv_filename", "customer_id", "invoice_id"]
-                    if all(col in mapping_df.columns for col in required_cols):
-                        st.session_state["invoice_mapping"] = mapping_df
-                        st.session_state["invoice_mapping_ready"] = True
-                        st.success(f"✅ Loaded {len(mapping_df)} mappings from uploaded CSV")
-                        st.dataframe(mapping_df, use_container_width=True)
-                    else:
-                        st.error(f"CSV must have columns: {', '.join(required_cols)}")
-                except Exception as e:
-                    st.error(f"Error reading CSV: {str(e)}")
-            else:
+            try:
+                mapping_df = pd.read_csv(uploaded_mapping)
+                required_cols = ["split_csv_filename", "customer_id", "invoice_id"]
+                if all(col in mapping_df.columns for col in required_cols):
+                    st.session_state["invoice_mapping"] = mapping_df
+                    st.session_state["invoice_mapping_ready"] = True
+                    st.success(f"✅ Loaded {len(mapping_df)} mappings from uploaded CSV")
+                    st.dataframe(mapping_df, use_container_width=True)
+                else:
+                    st.error(f"CSV must have columns: {', '.join(required_cols)}")
+            except Exception as e:
+                st.error(f"Error reading CSV: {str(e)}")
+        else:
                 # No file uploaded - generate mapping via API
-                st.markdown("---")
-                
-                # Invoice issue date selector
-                issue_date = st.date_input(
-                    "Select Invoice Issue Date",
-                    value=datetime.now().date(),
-                    help="Select the issue date for the invoices you want to map to"
-                )
-                
-                if st.button("Map Invoices to Split CSVs", type="primary"):
-                    if not api_key_attach:
-                        st.error("⚠️ Please enter API key first")
-                    elif not st.session_state.get("split_csvs_ready"):
-                        st.error("⚠️ No split CSVs found. Please complete Step 1 first.")
-                    else:
-                        split_csvs = st.session_state.get("invoice_split_csvs", [])
-                        with st.spinner("Mapping invoices..."):
-                            mapping_results = []
+            st.markdown("---")
+            
+            # Invoice issue date selector
+            issue_date = st.date_input(
+                "Select Invoice Issue Date",
+                value=datetime.now().date(),
+                help="Select the issue date for the invoices you want to map to"
+            )
+            
+            if st.button("Map Invoices to Split CSVs", type="primary"):
+                if not api_key_attach:
+                    st.error("⚠️ Please enter API key first")
+                elif not st.session_state.get("split_csvs_ready"):
+                    st.error("⚠️ No split CSVs found. Please complete Step 1 first.")
+                else:
+                    split_csvs = st.session_state.get("invoice_split_csvs", [])
+                    with st.spinner("Mapping invoices..."):
+                        mapping_results = []
+                        
+                        for split_csv in split_csvs:
+                            csv_df = pd.read_csv(BytesIO(split_csv["bytes"]))
+                            customer_id = None
                             
-                            for split_csv in split_csvs:
-                                csv_df = pd.read_csv(BytesIO(split_csv["bytes"]))
-                                customer_id = None
-                                
-                                # Try to get customer_id from the CSV
-                                if "customer_id" in csv_df.columns:
-                                    customer_ids = csv_df["customer_id"].dropna().unique()
-                                    # Validate: each split CSV must contain exactly one unique customer_id
-                                    if len(customer_ids) == 0:
-                                        mapping_results.append({
-                                            "split_csv_filename": split_csv["name"],
-                                            "customer_id": "N/A",
-                                            "invoice_id": "Not Found",
-                                            "status": "Failed",
-                                            "reason": "No customer ID in CSV"
-                                        })
-                                        continue
-                                    elif len(customer_ids) > 1:
-                                        mapping_results.append({
-                                            "split_csv_filename": split_csv["name"],
-                                            "customer_id": f"Multiple: {', '.join(map(str, customer_ids[:3]))}",
-                                            "invoice_id": "Not Found",
-                                            "status": "Failed",
-                                            "reason": f"CSV contains {len(customer_ids)} unique customer IDs (must be exactly 1)"
-                                        })
-                                        continue
-                                    else:
-                                        customer_id = str(customer_ids[0]).strip()
-                                
-                                if not customer_id:
+                            # Try to get customer_id from the CSV
+                            if "customer_id" in csv_df.columns:
+                                customer_ids = csv_df["customer_id"].dropna().unique()
+                                # Validate: each split CSV must contain exactly one unique customer_id
+                                if len(customer_ids) == 0:
                                     mapping_results.append({
                                         "split_csv_filename": split_csv["name"],
                                         "customer_id": "N/A",
@@ -3735,44 +3780,65 @@ with chunk_tab:
                                         "reason": "No customer ID in CSV"
                                     })
                                     continue
-                                
-                                # Look up invoice for this customer
-                                invoice_id = find_invoice_by_date(customer_id, issue_date, api_key_attach)
-                                
-                                if invoice_id:
+                                elif len(customer_ids) > 1:
                                     mapping_results.append({
                                         "split_csv_filename": split_csv["name"],
-                                        "customer_id": customer_id,
-                                        "invoice_id": invoice_id,
-                                        "status": "Success"
-                                    })
-                                else:
-                                    mapping_results.append({
-                                        "split_csv_filename": split_csv["name"],
-                                        "customer_id": customer_id,
+                                        "customer_id": f"Multiple: {', '.join(map(str, customer_ids[:3]))}",
                                         "invoice_id": "Not Found",
                                         "status": "Failed",
-                                        "reason": "No matching invoice found"
+                                        "reason": f"CSV contains {len(customer_ids)} unique customer IDs (must be exactly 1)"
                                     })
+                                    continue
+                                else:
+                                    customer_id = str(customer_ids[0]).strip()
                             
-                            mapping_df = pd.DataFrame(mapping_results)
-                            st.session_state["invoice_mapping"] = mapping_df
-                            st.session_state["invoice_mapping_ready"] = True
+                            if not customer_id:
+                                mapping_results.append({
+                                    "split_csv_filename": split_csv["name"],
+                                    "customer_id": "N/A",
+                                    "invoice_id": "Not Found",
+                                    "status": "Failed",
+                                    "reason": "No customer ID in CSV"
+                                })
+                                continue
                             
-                            # Show results
-                            success_count = (mapping_df["status"] == "Success").sum()
-                            st.success(f"✅ Mapped {success_count}/{len(mapping_df)} split CSVs to invoices")
+                            # Look up invoice for this customer
+                            invoice_id = find_invoice_by_date(customer_id, issue_date, api_key_attach)
                             
-                            # Show successful mappings
-                            successful_mappings = mapping_df[mapping_df["status"] == "Success"]
-                            if len(successful_mappings) > 0:
-                                st.dataframe(successful_mappings[["split_csv_filename", "customer_id", "invoice_id"]], use_container_width=True)
-                            
-                            # Show unmapped files
-                            unmapped = mapping_df[mapping_df["status"] == "Failed"]
-                            if len(unmapped) > 0:
-                                st.warning(f"⚠️ {len(unmapped)} Split CSVs Requiring Attention")
-                                st.dataframe(unmapped, use_container_width=True)
+                            if invoice_id:
+                                mapping_results.append({
+                                    "split_csv_filename": split_csv["name"],
+                                    "customer_id": customer_id,
+                                    "invoice_id": invoice_id,
+                                    "status": "Success"
+                                })
+                            else:
+                                mapping_results.append({
+                                    "split_csv_filename": split_csv["name"],
+                                    "customer_id": customer_id,
+                                    "invoice_id": "Not Found",
+                                    "status": "Failed",
+                                    "reason": "No matching invoice found"
+                                })
+                        
+                        mapping_df = pd.DataFrame(mapping_results)
+                        st.session_state["invoice_mapping"] = mapping_df
+                        st.session_state["invoice_mapping_ready"] = True
+                        
+                        # Show results
+                        success_count = (mapping_df["status"] == "Success").sum()
+                        st.success(f"✅ Mapped {success_count}/{len(mapping_df)} split CSVs to invoices")
+                        
+                        # Show successful mappings
+                        successful_mappings = mapping_df[mapping_df["status"] == "Success"]
+                        if len(successful_mappings) > 0:
+                            st.dataframe(successful_mappings[["split_csv_filename", "customer_id", "invoice_id"]], use_container_width=True)
+                        
+                        # Show unmapped files
+                        unmapped = mapping_df[mapping_df["status"] == "Failed"]
+                        if len(unmapped) > 0:
+                            st.warning(f"⚠️ {len(unmapped)} Split CSVs Requiring Attention")
+                            st.dataframe(unmapped, use_container_width=True)
     
     elif current_step == 2:  # Step 3: Bulk Upload
         st.subheader("Bulk Upload CSV Attachments")
@@ -3834,7 +3900,7 @@ with chunk_tab:
                     st.warning("⚠️ Please enter API key in Step 2")
                 else:
                     # Add test mode option
-                    test_mode = st.checkbox("🧪 Test Mode: Upload only one row from the first split CSV", value=False)
+                    test_mode = st.checkbox("🧪 Test Mode: Upload only the first split CSV", value=False)
                     
                     if st.button("Start Bulk Upload", type="primary"):
                         try:
@@ -3842,7 +3908,7 @@ with chunk_tab:
                                 upload_results = []
                                 progress_bar = st.progress(0)
                                 
-                                # Limit to first row if test mode is enabled (only use successful mappings)
+                                # Limit to first split CSV if test mode is enabled (only use successful mappings)
                                 rows_to_process = successful_mappings.head(1) if test_mode else successful_mappings
                                 
                                 for idx, row in rows_to_process.iterrows():
@@ -3886,32 +3952,6 @@ with chunk_tab:
                                             "reason": f"Error validating CSV: {str(e)}"
                                         })
                                         continue
-                                    
-                                    # In test mode, create a CSV with only the first row
-                                    if test_mode:
-                                        try:
-                                            test_df = pd.read_csv(BytesIO(split_csv_bytes))
-                                            if len(test_df) > 0:
-                                                # Keep only the first row
-                                                test_df = test_df.head(1)
-                                                # Create new filename with "_test" suffix
-                                                test_filename = split_csv_name.replace(".csv", "_test.csv")
-                                                split_csv_bytes = test_df.to_csv(index=False).encode("utf-8")
-                                                split_csv_name = test_filename
-                                            else:
-                                                upload_results.append({
-                                                    "split_csv": split_csv_name,
-                                                    "status": "Failed",
-                                                    "reason": "CSV is empty"
-                                                })
-                                                continue
-                                        except Exception as e:
-                                            upload_results.append({
-                                                "split_csv": split_csv_name,
-                                                "status": "Failed",
-                                                "reason": f"Error reading CSV: {str(e)}"
-                                            })
-                                            continue
                                     
                                     # Upload CSV as attachment to invoice
                                     success = upload_csv_attachment(

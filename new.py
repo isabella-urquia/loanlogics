@@ -2197,7 +2197,7 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
     
     # Combine rows with the same AccountName + account_id before concatenation
     # This prevents duplicates when a customer appears in both apps and units processing
-    # If a customer has the same AccountName and account_id in both, keep only one row (prefer "app")
+    # If a customer has the same AccountName and account_id in both, keep only one row (prefer "unit" to align with obligations validation)
     if len(income_upload_apps_filtered) > 0 and len(income_upload_units_filtered) > 0:
         # Create a key for matching: AccountName + account_id
         income_upload_apps_filtered["__match_key__"] = (
@@ -2215,8 +2215,9 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
         common_keys = apps_keys & units_keys
         
         if len(common_keys) > 0:
-            # For common keys, remove from units (keep the "app" row)
-            income_upload_units_filtered = income_upload_units_filtered[~income_upload_units_filtered["__match_key__"].isin(common_keys)]
+            # For common keys, remove from apps (keep the "unit" row)
+            # This aligns with obligations validation which prefers "unit" when both are available
+            income_upload_apps_filtered = income_upload_apps_filtered[~income_upload_apps_filtered["__match_key__"].isin(common_keys)]
         
         # Remove helper columns (all columns starting with "__" except __original_account_name__ and __finastra_account_id__ which we preserve)
         helper_cols_apps = [col for col in income_upload_apps_filtered.columns if col.startswith("__") and col not in ["__original_account_name__", "__finastra_account_id__"]]

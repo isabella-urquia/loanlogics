@@ -11,7 +11,7 @@ import warnings
 from collections import Counter
 from io import BytesIO
 from datetime import datetime
-from fpdf import FPDF
+from fpdf import FPDF  # fpdf2 package uses 'from fpdf import FPDF'
 
 # ============ CONFIG ============
 OUTPUT_DIR = "usage_uploads"
@@ -1871,6 +1871,25 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
             account_id = re.sub(r"[^0-9]", "", value_str)
             return account_id
 
+    def is_special_customer(name_series):
+        """Check if customer name matches Finastra, NewRez, or Click N Close (case-insensitive)"""
+        if name_series is None:
+            return pd.Series([False])
+        if isinstance(name_series, pd.Series):
+            if len(name_series) == 0:
+                return pd.Series([False])
+        else:
+            # If it's not a Series, try to convert
+            name_series = pd.Series([name_series])
+        name_str = name_series.astype(str)
+        return (
+            name_str.str.contains("Finastra", case=False, na=False) |
+            name_str.str.contains("NewRez", case=False, na=False) |
+            name_str.str.contains("New Rez", case=False, na=False) |
+            name_str.str.contains("Click N Close", case=False, na=False) |
+            name_str.str.contains("ClickNClose", case=False, na=False)
+        )
+    
     def process_usage(df: pd.DataFrame, event_type_name: str, qty_col_candidates: list[str]):
         df.columns = df.columns.str.strip()
         parent_col = find_column(df, ["customername", "accountname", "name"])
@@ -1923,16 +1942,16 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
         # This avoids issues with None values and ensures the mapping works on grouped data
         # Leave customer_id blank if AccountID mapping is not available.
         # IMPORTANT: Do not group by customer_id (it may be NaN and would drop all rows).
-        # For Finastra rows, group by AccountID instead of __acct_key__ (CustomerNumber)
-        # This ensures each Finastra AccountID gets its own row
-        finastra_mask = df[parent_col].astype(str).str.contains("Finastra", case=False, na=False)
+        # For special customers (Finastra, NewRez, Click N Close), group by AccountID instead of __acct_key__ (CustomerNumber)
+        # This ensures each AccountID gets its own row
+        special_customer_mask = is_special_customer(df[parent_col]) if parent_col else pd.Series([False] * len(df))
         
-        # Create grouping key: use AccountID for Finastra, __acct_key__ for others
+        # Create grouping key: use AccountID for special customers, __acct_key__ for others
         df["__group_key__"] = df["__acct_key__"]  # Default to CustomerNumber
-        if finastra_mask.any() and "AccountID" in df.columns:
-            # For Finastra: use AccountID (normalized to numeric string) instead of CustomerNumber
-            finastra_account_ids = df.loc[finastra_mask, "AccountID"].astype(str).str.replace(r"[^0-9]", "", regex=True)
-            df.loc[finastra_mask, "__group_key__"] = finastra_account_ids
+        if special_customer_mask.any() and "AccountID" in df.columns:
+            # For special customers: use AccountID (normalized to numeric string) instead of CustomerNumber
+            special_account_ids = df.loc[special_customer_mask, "AccountID"].astype(str).str.replace(r"[^0-9]", "", regex=True)
+            df.loc[special_customer_mask, "__group_key__"] = special_account_ids
         
         group_keys = ["AccountName", "__group_key__"]
         
@@ -1968,7 +1987,7 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
             grouped["customer_id"] = pd.NA
 
         grouped["event_type_name"] = event_type_name
-        # Differentiator: will be set later for Finastra only
+        # Differentiator: will be set later for special customers (Finastra, NewRez, Click N Close) only
         grouped["differentiator"] = ""
         grouped.rename(columns={datetime_col: "datetime"}, inplace=True)
         # Use usage_date if provided, otherwise use the datetime from the file
@@ -1980,14 +1999,14 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
         # account_id always represents CustomerNumber (__acct_key__)
         grouped["account_id"] = grouped["__acct_key__"] if "__acct_key__" in grouped.columns else pd.NA
         
-        # Store Finastra AccountID in separate column (from AccountID column when it's Finastra)
+        # Store AccountID in separate column for special customers (Finastra, NewRez, Click N Close)
         grouped["__finastra_account_id__"] = pd.NA
-        # Check for Finastra rows in grouped dataframe directly
-        grouped_finastra_mask = grouped["AccountName"].astype(str).str.contains("Finastra", case=False, na=False)
-        if "AccountID" in grouped.columns and grouped_finastra_mask.any():
+        # Check for special customer rows in grouped dataframe directly
+        grouped_special_mask = is_special_customer(grouped["AccountName"]) if "AccountName" in grouped.columns else pd.Series([False] * len(grouped))
+        if "AccountID" in grouped.columns and grouped_special_mask.any():
             # Extract AccountID as normalized numeric string (matching the format used in aggregation)
-            grouped.loc[grouped_finastra_mask, "__finastra_account_id__"] = (
-                grouped.loc[grouped_finastra_mask, "AccountID"].astype(str).str.replace(r"[^0-9]", "", regex=True)
+            grouped.loc[grouped_special_mask, "__finastra_account_id__"] = (
+                grouped.loc[grouped_special_mask, "AccountID"].astype(str).str.replace(r"[^0-9]", "", regex=True)
             )
         
         # Include __original_account_name__ in return if it exists
@@ -1997,7 +2016,7 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
         # Include AccountID if it exists
         if "AccountID" in grouped.columns:
             return_cols.append("AccountID")
-        # Include __finastra_account_id__ if it exists (for Finastra differentiators)
+        # Include __finastra_account_id__ if it exists (for special customer differentiators)
         if "__finastra_account_id__" in grouped.columns:
             return_cols.append("__finastra_account_id__")
         return grouped[return_cols]
@@ -2087,28 +2106,28 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
         account_id_to_customer_from_custom_field = account_id_to_customer_from_file.copy()
         # Customer mappings loaded silently
 
-    # Build AccountID -> account name mapping for Finastra accounts from ORIGINAL dataframes
-    # This ensures we capture all Finastra rows before any grouping/aggregation
+    # Build AccountID -> account name mapping for special customers (Finastra, NewRez, Click N Close) from ORIGINAL dataframes
+    # This ensures we capture all special customer rows before any grouping/aggregation
     # Strategy: Group by AccountID and find the best account name for each AccountID
     account_id_to_name = {}
     
     # Build mapping from income_df (original, before processing)
     if "AccountID" in income_df.columns:
-        # Find Finastra rows - check all possible name columns
-        income_finastra_mask = pd.Series([False] * len(income_df))
+        # Find special customer rows - check all possible name columns
+        income_special_mask = pd.Series([False] * len(income_df))
         name_columns = []
         if "AccountName" in income_df.columns:
             name_columns.append("AccountName")
-            income_finastra_mask = income_finastra_mask | income_df["AccountName"].astype(str).str.contains("Finastra", case=False, na=False)
+            income_special_mask = income_special_mask | is_special_customer(income_df["AccountName"])
         if "CustomerName" in income_df.columns:
             name_columns.append("CustomerName")
-            income_finastra_mask = income_finastra_mask | income_df["CustomerName"].astype(str).str.contains("Finastra", case=False, na=False)
+            income_special_mask = income_special_mask | is_special_customer(income_df["CustomerName"])
         
-        if income_finastra_mask.any():
-            finastra_income_rows = income_df[income_finastra_mask]
+        if income_special_mask.any():
+            special_income_rows = income_df[income_special_mask]
             
             # Group by AccountID to get unique account names per AccountID
-            for account_id_raw, group in finastra_income_rows.groupby("AccountID"):
+            for account_id_raw, group in special_income_rows.groupby("AccountID"):
                 account_id_raw = str(account_id_raw).strip()
                 if not account_id_raw or account_id_raw.lower() in ["nan", "none", ""]:
                     continue
@@ -2122,10 +2141,10 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
                     names = group[col].dropna().astype(str).str.strip()
                     names = names[names != ""]
                     if len(names) > 0:
-                        # Prefer names with "Finastra - " format
-                        finastra_names = [n for n in names if "Finastra - " in n]
-                        if finastra_names:
-                            account_name = finastra_names[0]
+                        # Prefer names with special customer prefix format (e.g., "Finastra - ", "NewRez - ", etc.)
+                        special_names = [n for n in names if any(prefix in n for prefix in ["Finastra - ", "NewRez - ", "New Rez - ", "Click N Close - ", "ClickNClose - "])]
+                        if special_names:
+                            account_name = special_names[0]
                             break
                         elif not account_name:
                             # Use first non-empty name as fallback
@@ -2133,26 +2152,26 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
                 
                 # Store mapping if we found a valid account name
                 if account_name and account_name.lower() != "nan":
-                    if account_id not in account_id_to_name or "Finastra - " in account_name:
+                    if account_id not in account_id_to_name or any(prefix in account_name for prefix in ["Finastra - ", "NewRez - ", "New Rez - ", "Click N Close - ", "ClickNClose - "]):
                         account_id_to_name[account_id] = account_name
     
     # Build mapping from lbpa_df (original, before processing)
     if "AccountID" in lbpa_df.columns:
-        # Find Finastra rows - check all possible name columns
-        lbpa_finastra_mask = pd.Series([False] * len(lbpa_df))
+        # Find special customer rows - check all possible name columns
+        lbpa_special_mask = pd.Series([False] * len(lbpa_df))
         name_columns = []
         if "AccountName" in lbpa_df.columns:
             name_columns.append("AccountName")
-            lbpa_finastra_mask = lbpa_finastra_mask | lbpa_df["AccountName"].astype(str).str.contains("Finastra", case=False, na=False)
+            lbpa_special_mask = lbpa_special_mask | is_special_customer(lbpa_df["AccountName"])
         if "CustomerName" in lbpa_df.columns:
             name_columns.append("CustomerName")
-            lbpa_finastra_mask = lbpa_finastra_mask | lbpa_df["CustomerName"].astype(str).str.contains("Finastra", case=False, na=False)
+            lbpa_special_mask = lbpa_special_mask | is_special_customer(lbpa_df["CustomerName"])
         
-        if lbpa_finastra_mask.any():
-            finastra_lbpa_rows = lbpa_df[lbpa_finastra_mask]
+        if lbpa_special_mask.any():
+            special_lbpa_rows = lbpa_df[lbpa_special_mask]
             
             # Group by AccountID to get unique account names per AccountID
-            for account_id_raw, group in finastra_lbpa_rows.groupby("AccountID"):
+            for account_id_raw, group in special_lbpa_rows.groupby("AccountID"):
                 account_id_raw = str(account_id_raw).strip()
                 if not account_id_raw or account_id_raw.lower() in ["nan", "none", ""]:
                     continue
@@ -2166,10 +2185,10 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
                     names = group[col].dropna().astype(str).str.strip()
                     names = names[names != ""]
                     if len(names) > 0:
-                        # Prefer names with "Finastra - " format
-                        finastra_names = [n for n in names if "Finastra - " in n]
-                        if finastra_names:
-                            account_name = finastra_names[0]
+                        # Prefer names with special customer prefix format (e.g., "Finastra - ", "NewRez - ", etc.)
+                        special_names = [n for n in names if any(prefix in n for prefix in ["Finastra - ", "NewRez - ", "New Rez - ", "Click N Close - ", "ClickNClose - "])]
+                        if special_names:
+                            account_name = special_names[0]
                             break
                         elif not account_name:
                             # Use first non-empty name as fallback
@@ -2177,7 +2196,7 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
                 
                 # Store mapping if we found a valid account name
                 if account_name and account_name.lower() != "nan":
-                    if "Finastra - " in account_name:
+                    if any(prefix in account_name for prefix in ["Finastra - ", "NewRez - ", "New Rez - ", "Click N Close - ", "ClickNClose - "]):
                         account_id_to_name[account_id] = account_name
     
     # Process Income for both "Per Application" and "Units" separately
@@ -2246,35 +2265,34 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
     if acct_to_lbpa_evt:
         lbpa_upload["event_type_name"] = lbpa_upload["account_id"].map(acct_to_lbpa_evt).fillna(lbpa_upload["event_type_name"])
     
-    # Set differentiators for Finastra rows in income_upload and lbpa_upload BEFORE concatenation
+    # Set differentiators for special customers (Finastra, NewRez, Click N Close) in income_upload and lbpa_upload BEFORE concatenation
     def set_finastra_differentiators(df, account_id_to_name_map, df_name=""):
-        """Set differentiators for Finastra rows in a dataframe"""
-        finastra_mask = (
-            df.get("CustomerName", pd.Series([""] * len(df))).astype(str).str.contains("Finastra", case=False, na=False) |
-            df.get("AccountName", pd.Series([""] * len(df))).astype(str).str.contains("Finastra", case=False, na=False)
-        )
-        if not finastra_mask.any():
+        """Set differentiators for special customers (Finastra, NewRez, Click N Close) in a dataframe"""
+        customer_name_series = df.get("CustomerName", pd.Series([""] * len(df)))
+        account_name_series = df.get("AccountName", pd.Series([""] * len(df)))
+        special_mask = is_special_customer(customer_name_series) | is_special_customer(account_name_series)
+        if not special_mask.any():
             return df
         
-        finastra_rows = df[finastra_mask].copy()
-        mapped_differentiators = pd.Series(index=finastra_rows.index, dtype=str)
+        special_rows = df[special_mask].copy()
+        mapped_differentiators = pd.Series(index=special_rows.index, dtype=str)
         
         if account_id_to_name_map:
             # Use __finastra_account_id__ column only (no AccountID fallback)
-            if "__finastra_account_id__" in finastra_rows.columns:
-                finastra_account_ids = finastra_rows["__finastra_account_id__"].astype(str).str.replace(r"[^0-9]", "", regex=True)
-                mapped_by_account_id = finastra_account_ids.map(account_id_to_name_map)
+            if "__finastra_account_id__" in special_rows.columns:
+                special_account_ids = special_rows["__finastra_account_id__"].astype(str).str.replace(r"[^0-9]", "", regex=True)
+                mapped_by_account_id = special_account_ids.map(account_id_to_name_map)
                 mapped_differentiators = mapped_by_account_id.fillna("")
             else:
                 # If __finastra_account_id__ is missing, leave differentiator empty
-                mapped_differentiators = pd.Series(index=finastra_rows.index, dtype=str)
+                mapped_differentiators = pd.Series(index=special_rows.index, dtype=str)
                 mapped_differentiators[:] = ""
             
-            df.loc[finastra_mask, "differentiator"] = mapped_differentiators
+            df.loc[special_mask, "differentiator"] = mapped_differentiators
         else:
             # Fallback: use original_account_name if available (renamed from __original_account_name__)
             if "original_account_name" in df.columns:
-                df.loc[finastra_mask, "differentiator"] = df.loc[finastra_mask, "original_account_name"].astype(str).str.strip()
+                df.loc[special_mask, "differentiator"] = df.loc[special_mask, "original_account_name"].astype(str).str.strip()
         
         return df
     
@@ -2321,6 +2339,7 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
                 combined_internal.loc[unmapped_mask, "customer_id"] = mapped
     
     # Direct Finastra fallback: Apply Finastra customer_id to any Finastra rows that still don't have it
+    # Note: This fallback is Finastra-specific and not extended to other special customers
     if finastra_customer_id_from_file:
         # Check for Finastra rows by CustomerName or AccountName
         name_col = None
@@ -2423,31 +2442,31 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
     
     lbpa_valid_mask = lbpa_df_with_customer["customer_id"].notna()
     
-    # For Finastra customers, we need to group by customer_id + account_id (differentiator)
+    # For special customers (Finastra, NewRez, Click N Close), we need to group by customer_id + account_id (differentiator)
     # For other customers, group by customer_id only
-    # First, identify Finastra customers
-    income_finastra_mask = income_df_with_customer["CustomerName"].astype(str).str.contains("finastra", case=False, na=False)
-    lbpa_finastra_mask = lbpa_df_with_customer["CustomerName"].astype(str).str.contains("finastra", case=False, na=False)
+    # First, identify special customers
+    income_special_mask = is_special_customer(income_df_with_customer["CustomerName"]) if "CustomerName" in income_df_with_customer.columns else pd.Series([False] * len(income_df_with_customer))
+    lbpa_special_mask = is_special_customer(lbpa_df_with_customer["CustomerName"]) if "CustomerName" in lbpa_df_with_customer.columns else pd.Series([False] * len(lbpa_df_with_customer))
     
-    # Create a grouping key: for Finastra use customer_id + AccountID (since CustomerNumber is same for all), for others just customer_id
+    # Create a grouping key: for special customers use customer_id + AccountID (since CustomerNumber is same for all), for others just customer_id
     income_df_with_customer["__group_key__"] = income_df_with_customer["customer_id"]
     if "AccountID" in income_df_with_customer.columns:
-        income_finastra_rows = income_df_with_customer[income_finastra_mask & income_valid_mask]
-        if len(income_finastra_rows) > 0:
-            # For Finastra, use customer_id + AccountID (AccountID distinguishes differentiators)
-            income_df_with_customer.loc[income_finastra_mask & income_valid_mask, "__group_key__"] = (
-                income_df_with_customer.loc[income_finastra_mask & income_valid_mask, "customer_id"].astype(str) + "_" +
-                income_df_with_customer.loc[income_finastra_mask & income_valid_mask, "AccountID"].astype(str).str.replace(r"[^0-9]", "", regex=True)
+        income_special_rows = income_df_with_customer[income_special_mask & income_valid_mask]
+        if len(income_special_rows) > 0:
+            # For special customers, use customer_id + AccountID (AccountID distinguishes differentiators)
+            income_df_with_customer.loc[income_special_mask & income_valid_mask, "__group_key__"] = (
+                income_df_with_customer.loc[income_special_mask & income_valid_mask, "customer_id"].astype(str) + "_" +
+                income_df_with_customer.loc[income_special_mask & income_valid_mask, "AccountID"].astype(str).str.replace(r"[^0-9]", "", regex=True)
             )
     
     lbpa_df_with_customer["__group_key__"] = lbpa_df_with_customer["customer_id"]
     if "AccountID" in lbpa_df_with_customer.columns:
-        lbpa_finastra_rows = lbpa_df_with_customer[lbpa_finastra_mask & lbpa_valid_mask]
-        if len(lbpa_finastra_rows) > 0:
-            # For Finastra, use customer_id + AccountID (AccountID distinguishes differentiators)
-            lbpa_df_with_customer.loc[lbpa_finastra_mask & lbpa_valid_mask, "__group_key__"] = (
-                lbpa_df_with_customer.loc[lbpa_finastra_mask & lbpa_valid_mask, "customer_id"].astype(str) + "_" +
-                lbpa_df_with_customer.loc[lbpa_finastra_mask & lbpa_valid_mask, "AccountID"].astype(str).str.replace(r"[^0-9]", "", regex=True)
+        lbpa_special_rows = lbpa_df_with_customer[lbpa_special_mask & lbpa_valid_mask]
+        if len(lbpa_special_rows) > 0:
+            # For special customers, use customer_id + AccountID (AccountID distinguishes differentiators)
+            lbpa_df_with_customer.loc[lbpa_special_mask & lbpa_valid_mask, "__group_key__"] = (
+                lbpa_df_with_customer.loc[lbpa_special_mask & lbpa_valid_mask, "customer_id"].astype(str) + "_" +
+                lbpa_df_with_customer.loc[lbpa_special_mask & lbpa_valid_mask, "AccountID"].astype(str).str.replace(r"[^0-9]", "", regex=True)
             )
     
     # Sum UnitsAsPerSubmission and IsInitialSubmission from Income file per group_key
@@ -2491,15 +2510,15 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
     
     # Create group_key in combined_internal for mapping
     combined_internal["__group_key__"] = combined_internal["customer_id"].astype(str)
-    finastra_mask = combined_internal["CustomerName"].astype(str).str.contains("finastra", case=False, na=False)
+    special_mask = is_special_customer(combined_internal["CustomerName"]) if "CustomerName" in combined_internal.columns else pd.Series([False] * len(combined_internal))
     
-    # For Finastra, use customer_id + __finastra_account_id__ (matching Income/LBPA format: customer_id + AccountID)
+    # For special customers, use customer_id + __finastra_account_id__ (matching Income/LBPA format: customer_id + AccountID)
     if "__finastra_account_id__" in combined_internal.columns:
-        finastra_with_account = finastra_mask & combined_internal["__finastra_account_id__"].notna()
+        special_with_account = special_mask & combined_internal["__finastra_account_id__"].notna()
         # Use customer_id + AccountID format (matching Income/LBPA aggregation)
-        combined_internal.loc[finastra_with_account, "__group_key__"] = (
-            combined_internal.loc[finastra_with_account, "customer_id"].astype(str) + "_" +
-            combined_internal.loc[finastra_with_account, "__finastra_account_id__"].astype(str).str.replace(r"[^0-9]", "", regex=True)
+        combined_internal.loc[special_with_account, "__group_key__"] = (
+            combined_internal.loc[special_with_account, "customer_id"].astype(str) + "_" +
+            combined_internal.loc[special_with_account, "__finastra_account_id__"].astype(str).str.replace(r"[^0-9]", "", regex=True)
         )
     
     # Map sums to all rows using group_key
@@ -2536,56 +2555,55 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
     if "CustomerName" not in combined_internal.columns:
         combined_internal["CustomerName"] = combined_internal.get("AccountName", "")
     
-    # Differentiators for Finastra rows are already set before concatenation
-    # Just ensure non-Finastra rows have empty differentiator
+    # Differentiators for special customers (Finastra, NewRez, Click N Close) are already set before concatenation
+    # Just ensure non-special customer rows have empty differentiator
     # Only update if differentiator is not already set (preserve what was set by set_finastra_differentiators)
-    finastra_mask = (
-        combined_internal["CustomerName"].astype(str).str.contains("Finastra", case=False, na=False) |
-        combined_internal.get("AccountName", pd.Series([""] * len(combined_internal))).astype(str).str.contains("Finastra", case=False, na=False)
-    )
+    customer_name_series = combined_internal.get("CustomerName", pd.Series([""] * len(combined_internal)))
+    account_name_series = combined_internal.get("AccountName", pd.Series([""] * len(combined_internal)))
+    special_mask = is_special_customer(customer_name_series) | is_special_customer(account_name_series)
     
-    # Only set differentiator for Finastra rows that don't already have one
+    # Only set differentiator for special customer rows that don't already have one
     # This preserves the differentiators set by set_finastra_differentiators which uses __finastra_account_id__
-    if finastra_mask.any():
-        finastra_rows_mask = finastra_mask & (
+    if special_mask.any():
+        special_rows_mask = special_mask & (
             combined_internal["differentiator"].isna() | 
             (combined_internal["differentiator"].astype(str).str.strip() == "")
         )
         
-        if finastra_rows_mask.any() and account_id_to_name:
+        if special_rows_mask.any() and account_id_to_name:
             # Fill in missing differentiators using __finastra_account_id__ only (no AccountID fallback)
-            finastra_rows = combined_internal[finastra_rows_mask].copy()
-            if "__finastra_account_id__" in finastra_rows.columns:
-                finastra_account_ids = finastra_rows["__finastra_account_id__"].astype(str).str.replace(r"[^0-9]", "", regex=True)
-                mapped_differentiators = finastra_account_ids.map(account_id_to_name)
+            special_rows = combined_internal[special_rows_mask].copy()
+            if "__finastra_account_id__" in special_rows.columns:
+                special_account_ids = special_rows["__finastra_account_id__"].astype(str).str.replace(r"[^0-9]", "", regex=True)
+                mapped_differentiators = special_account_ids.map(account_id_to_name)
             else:
                 # If __finastra_account_id__ is missing, leave differentiator empty
-                mapped_differentiators = pd.Series(index=finastra_rows.index, dtype=str)
+                mapped_differentiators = pd.Series(index=special_rows.index, dtype=str)
                 mapped_differentiators[:] = ""
                 
             # Fill in any unmapped ones using original_account_name as fallback (renamed from __original_account_name__)
             unmapped_mask = mapped_differentiators.isna() | (mapped_differentiators == "")
-            if unmapped_mask.any() and "original_account_name" in finastra_rows.columns:
-                unmapped_rows = finastra_rows[unmapped_mask]
+            if unmapped_mask.any() and "original_account_name" in special_rows.columns:
+                unmapped_rows = special_rows[unmapped_mask]
                 for idx in unmapped_rows.index:
                     original_name = str(unmapped_rows.loc[idx, "original_account_name"]).strip()
                     if original_name and original_name.lower() != "nan":
                         mapped_differentiators.loc[idx] = original_name
             
-            # Set differentiators for Finastra rows that don't have one
-            combined_internal.loc[finastra_rows_mask, "differentiator"] = mapped_differentiators.fillna("")
+            # Set differentiators for special customer rows that don't have one
+            combined_internal.loc[special_rows_mask, "differentiator"] = mapped_differentiators.fillna("")
         elif "original_account_name" in combined_internal.columns:
             # Fallback: use original_account_name if account_id_to_name not available (renamed from __original_account_name__)
-            combined_internal.loc[finastra_rows_mask, "differentiator"] = (
-                combined_internal.loc[finastra_rows_mask, "original_account_name"].astype(str)
+            combined_internal.loc[special_rows_mask, "differentiator"] = (
+                combined_internal.loc[special_rows_mask, "original_account_name"].astype(str)
             )
     
-    # Set differentiator to empty for non-Finastra customers (only if not already set)
-    non_finastra_mask = ~finastra_mask & (
+    # Set differentiator to empty for non-special customers (only if not already set)
+    non_special_mask = ~special_mask & (
         combined_internal["differentiator"].isna() | 
         (combined_internal["differentiator"].astype(str).str.strip() == "")
     )
-    combined_internal.loc[non_finastra_mask, "differentiator"] = ""
+    combined_internal.loc[non_special_mask, "differentiator"] = ""
     
     # Initialize invoice column
     combined_internal["invoice"] = ""
@@ -2875,10 +2893,11 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
     
     combined = mapped_df[upload_cols].copy()
     
-    # Identify Finastra rows BEFORE converting to numeric
+    # Identify special customer rows (with differentiators) BEFORE converting to numeric
+    # This includes Finastra, NewRez, and Click N Close customers
     finastra_rows = combined["differentiator"].astype(str).str.strip() != ""
     
-    # Store original Finastra values BEFORE numeric conversion
+    # Store original special customer values BEFORE numeric conversion
     finastra_is_initial = None
     finastra_units = None
     if finastra_rows.any():
@@ -2894,7 +2913,7 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
         combined["UnitsAsPerSubmission"], errors="coerce"
     ).fillna(0)
     
-    # Restore original Finastra values (preserve the actual values, not fillna(0))
+    # Restore original special customer values (preserve the actual values, not fillna(0))
     if finastra_rows.any() and finastra_is_initial is not None:
         # Convert original values to numeric but preserve the actual values
         finastra_is_initial_numeric = pd.to_numeric(finastra_is_initial, errors="coerce")
@@ -3109,7 +3128,23 @@ def generate_split_csvs_with_all_columns(income_df, lbpa_df, usage_df):
         
         filename = f"{safe_name}_{customer_id}.csv"
         # Only include original columns + customer_id (exclude helper columns)
-        group_clean = group[[col for col in columns_to_keep if col in group.columns]]
+        available_cols = [col for col in columns_to_keep if col in group.columns]
+        
+        # Reorder columns: AccountName and CustomerName first
+        ordered_cols = []
+        priority_cols = ["AccountName", "CustomerName"]
+        
+        # Add priority columns first if they exist
+        for priority_col in priority_cols:
+            if priority_col in available_cols:
+                ordered_cols.append(priority_col)
+        
+        # Add remaining columns (excluding the ones we already added)
+        for col in available_cols:
+            if col not in ordered_cols:
+                ordered_cols.append(col)
+        
+        group_clean = group[ordered_cols]
         split_csv_bytes = group_clean.to_csv(index=False).encode("utf-8")
         results.append({"name": filename, "bytes": split_csv_bytes})
     return results

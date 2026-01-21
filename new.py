@@ -1742,6 +1742,7 @@ def extract_mappings_from_clients(uploaded_clients):
     acct_to_ns_id: dict[str, str] = {}
     acct_to_income_evt: dict[str, str] = {}
     acct_to_lbpa_evt: dict[str, str] = {}
+    acct_to_nqm_evt: dict[str, str] = {}
     acct_to_diff_name: dict[str, str] = {}
     acct_to_base_name: dict[str, str] = {}
     
@@ -1781,12 +1782,16 @@ def extract_mappings_from_clients(uploaded_clients):
             acct_key = re.sub(r"[^0-9]", "", str(r[acctnum_col]))
             rev_val = str(r[rev_type_col]).strip().lower() if rev_type_col else ""
             bill_val = str(r[billing_type_col]).strip().lower() if billing_type_col else ""
-            evt = "Units" if "unit" in bill_val else ("Per Application" if bill_val else None)
-            if acct_key and evt:
+            if acct_key and bill_val:
                 if "income" in rev_val:
-                    acct_to_income_evt[acct_key] = evt
+                    # Map directly to final Income event types: "app" or "unit"
+                    acct_to_income_evt[acct_key] = "unit" if "unit" in bill_val else "app"
                 if "lbpa" in rev_val or "l b p a" in rev_val or "loanbeam per application" in rev_val:
-                    acct_to_lbpa_evt[acct_key] = evt
+                    # Map directly to final LBPA event types: "LBPA app" or "LBPA unit"
+                    acct_to_lbpa_evt[acct_key] = "LBPA unit" if "unit" in bill_val else "LBPA app"
+                if "nqm" in rev_val:
+                    # Map directly to final NQM event types: "NQM app" or "NQM unit"
+                    acct_to_nqm_evt[acct_key] = "NQM unit" if "unit" in bill_val else "NQM app"
     
     parent_to_id = {normalize_name(k): v for k, v in parent_to_id_raw.items()}
     
@@ -1796,12 +1801,13 @@ def extract_mappings_from_clients(uploaded_clients):
         "acct_to_ns_id": acct_to_ns_id,
         "acct_to_income_evt": acct_to_income_evt,
         "acct_to_lbpa_evt": acct_to_lbpa_evt,
+        "acct_to_nqm_evt": acct_to_nqm_evt,
         "acct_to_diff_name": acct_to_diff_name,
         "acct_to_base_name": acct_to_base_name,
     }
 
-def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_clients=None, resolve_now: bool = False, usage_date=None, mappings=None, split_customers=None, api_key=None):
-    """Transform usage data from income and LBPA files"""
+def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_nqm, uploaded_clients=None, resolve_now: bool = False, usage_date=None, mappings=None, split_customers=None, api_key=None):
+    """Transform usage data from income, LBPA, and NQM files"""
     # Load mappings: use provided mappings, or extract from clients file, or load from disk
     if mappings:
         # Use provided mappings
@@ -1810,6 +1816,7 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
         acct_to_ns_id = mappings.get("acct_to_ns_id", {})
         acct_to_income_evt = mappings.get("acct_to_income_evt", {})
         acct_to_lbpa_evt = mappings.get("acct_to_lbpa_evt", {})
+        acct_to_nqm_evt = mappings.get("acct_to_nqm_evt", {})
         acct_to_diff_name = mappings.get("acct_to_diff_name", {})
         acct_to_base_name = mappings.get("acct_to_base_name", {})
     elif uploaded_clients:
@@ -1822,6 +1829,7 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
         acct_to_ns_id = mappings.get("acct_to_ns_id", {})
         acct_to_income_evt = mappings.get("acct_to_income_evt", {})
         acct_to_lbpa_evt = mappings.get("acct_to_lbpa_evt", {})
+        acct_to_nqm_evt = mappings.get("acct_to_nqm_evt", {})
         acct_to_diff_name = mappings.get("acct_to_diff_name", {})
         acct_to_base_name = mappings.get("acct_to_base_name", {})
     else:
@@ -1842,6 +1850,7 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
             acct_to_ns_id = {}
             acct_to_income_evt = {}
             acct_to_lbpa_evt = {}
+            acct_to_nqm_evt = {}
             acct_to_diff_name = {}
             acct_to_base_name = {}
             try:
@@ -2023,6 +2032,7 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
 
     income_df = pd.read_csv(uploaded_income)
     lbpa_df = pd.read_csv(uploaded_lbpa)
+    nqm_df = pd.read_csv(uploaded_nqm)
     
     # Build AccountID to customer_id mapping from customer file if provided
     account_id_to_customer_from_file = {}
@@ -2199,12 +2209,13 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
                     if any(prefix in account_name for prefix in ["Finastra - ", "NewRez - ", "New Rez - ", "Click N Close - ", "ClickNClose - "]):
                         account_id_to_name[account_id] = account_name
     
-    # Process Income for both "Per Application" and "Units" separately
-    income_upload_apps = process_usage(income_df, "Per Application",
+    # Process Income for both "app" and "unit" separately
+    # Use temporary markers that will be replaced with actual API event type names
+    income_upload_apps = process_usage(income_df, "__APP__",
                                        ["isinitialsubmission", "perapplication", "applicationcount"])
     income_upload_apps["ApplicationTypeName"] = "Income"
 
-    income_upload_units = process_usage(income_df, "Units",
+    income_upload_units = process_usage(income_df, "__UNIT__",
                                         ["unitsaspersubmission", "units", "unitcount"])
     income_upload_units["ApplicationTypeName"] = "Income"
 
@@ -2258,14 +2269,67 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
     if acct_to_income_evt:
         income_upload["event_type_name"] = income_upload["account_id"].map(acct_to_income_evt).fillna(income_upload["event_type_name"])
 
-    lbpa_upload = process_usage(lbpa_df, "Units",
+    lbpa_upload = process_usage(lbpa_df, "__LBPA_UNIT__",
                                 ["unitsaspersubmission", "units", "unitcount"])
     lbpa_upload["ApplicationTypeName"] = "LBPA"
     
     if acct_to_lbpa_evt:
         lbpa_upload["event_type_name"] = lbpa_upload["account_id"].map(acct_to_lbpa_evt).fillna(lbpa_upload["event_type_name"])
     
-    # Set differentiators for special customers (Finastra, NewRez, Click N Close) in income_upload and lbpa_upload BEFORE concatenation
+    # Process NQM for both "NQM app" and "NQM unit" separately (similar to Income)
+    nqm_upload_apps = process_usage(nqm_df, "__NQM_APP__",
+                                    ["isinitialsubmission", "perapplication", "applicationcount"])
+    nqm_upload_apps["ApplicationTypeName"] = "NQM"
+    
+    nqm_upload_units = process_usage(nqm_df, "__NQM_UNIT__",
+                                     ["unitsaspersubmission", "units", "unitcount"])
+    nqm_upload_units["ApplicationTypeName"] = "NQM"
+    
+    # Filter out rows with zero values before concatenation
+    nqm_upload_apps_filtered = nqm_upload_apps[nqm_upload_apps["value"] > 0].copy() if len(nqm_upload_apps) > 0 else nqm_upload_apps
+    nqm_upload_units_filtered = nqm_upload_units[nqm_upload_units["value"] > 0].copy() if len(nqm_upload_units) > 0 else nqm_upload_units
+    
+    # Combine rows with the same AccountName + account_id before concatenation (similar to Income)
+    if len(nqm_upload_apps_filtered) > 0 and len(nqm_upload_units_filtered) > 0:
+        nqm_upload_apps_filtered["__match_key__"] = (
+            nqm_upload_apps_filtered["AccountName"].astype(str) + "_" + 
+            nqm_upload_apps_filtered["account_id"].astype(str)
+        )
+        nqm_upload_units_filtered["__match_key__"] = (
+            nqm_upload_units_filtered["AccountName"].astype(str) + "_" + 
+            nqm_upload_units_filtered["account_id"].astype(str)
+        )
+        
+        apps_keys = set(nqm_upload_apps_filtered["__match_key__"].unique())
+        units_keys = set(nqm_upload_units_filtered["__match_key__"].unique())
+        common_keys = apps_keys & units_keys
+        
+        if len(common_keys) > 0:
+            # For common keys, remove from units (keep the "app" row)
+            # NQM prefers "app" over "unit" (opposite of Income)
+            nqm_upload_units_filtered = nqm_upload_units_filtered[~nqm_upload_units_filtered["__match_key__"].isin(common_keys)]
+        
+        # Remove helper columns
+        helper_cols_apps = [col for col in nqm_upload_apps_filtered.columns if col.startswith("__") and col not in ["__original_account_name__", "__finastra_account_id__"]]
+        helper_cols_units = [col for col in nqm_upload_units_filtered.columns if col.startswith("__") and col not in ["__original_account_name__", "__finastra_account_id__"]]
+        if helper_cols_apps:
+            nqm_upload_apps_filtered = nqm_upload_apps_filtered.drop(columns=helper_cols_apps, errors="ignore")
+        if helper_cols_units:
+            nqm_upload_units_filtered = nqm_upload_units_filtered.drop(columns=helper_cols_units, errors="ignore")
+        
+        # Rename __original_account_name__ to original_account_name to preserve it
+        if "__original_account_name__" in nqm_upload_apps_filtered.columns:
+            nqm_upload_apps_filtered = nqm_upload_apps_filtered.rename(columns={"__original_account_name__": "original_account_name"})
+        if "__original_account_name__" in nqm_upload_units_filtered.columns:
+            nqm_upload_units_filtered = nqm_upload_units_filtered.rename(columns={"__original_account_name__": "original_account_name"})
+    
+    # Concatenate NQM apps and units
+    nqm_upload = pd.concat([nqm_upload_apps_filtered, nqm_upload_units_filtered], ignore_index=True)
+    # Apply optional event type overrides from mapping (by account_id)
+    if acct_to_nqm_evt:
+        nqm_upload["event_type_name"] = nqm_upload["account_id"].map(acct_to_nqm_evt).fillna(nqm_upload["event_type_name"])
+    
+    # Set differentiators for special customers (Finastra, NewRez, Click N Close) in income_upload, lbpa_upload, and nqm_upload BEFORE concatenation
     def set_finastra_differentiators(df, account_id_to_name_map, df_name=""):
         """Set differentiators for special customers (Finastra, NewRez, Click N Close) in a dataframe"""
         customer_name_series = df.get("CustomerName", pd.Series([""] * len(df)))
@@ -2296,26 +2360,13 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
         
         return df
     
-    # Apply differentiators to both uploads
+    # Apply differentiators to all uploads
     income_upload = set_finastra_differentiators(income_upload, account_id_to_name, "income_upload")
     lbpa_upload = set_finastra_differentiators(lbpa_upload, account_id_to_name, "lbpa_upload")
+    nqm_upload = set_finastra_differentiators(nqm_upload, account_id_to_name, "nqm_upload")
     
     # Final combined usage (internal dataframe with account_id)
-    combined_internal = pd.concat([income_upload, lbpa_upload], ignore_index=True)
-    
-    # Map event_type_name based on ApplicationTypeName
-    # Income: "Per Application" -> "app", "Units" -> "unit"
-    # LBPA: "Per Application" -> "LBPA app", "Units" -> "LBPA unit"
-    income_mask = combined_internal["ApplicationTypeName"] == "Income"
-    lbpa_mask = combined_internal["ApplicationTypeName"] == "LBPA"
-    
-    # Income mapping
-    combined_internal.loc[income_mask & (combined_internal["event_type_name"] == "Per Application"), "event_type_name"] = "app"
-    combined_internal.loc[income_mask & (combined_internal["event_type_name"] == "Units"), "event_type_name"] = "unit"
-    
-    # LBPA mapping
-    combined_internal.loc[lbpa_mask & (combined_internal["event_type_name"] == "Per Application"), "event_type_name"] = "LBPA app"
-    combined_internal.loc[lbpa_mask & (combined_internal["event_type_name"] == "Units"), "event_type_name"] = "LBPA unit"
+    combined_internal = pd.concat([income_upload, lbpa_upload, nqm_upload], ignore_index=True)
     
     # Keep customer_id as nullable until final CSV export
     
@@ -2323,6 +2374,90 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
     # Initialize customer_id column if it doesn't exist
     if "customer_id" not in combined_internal.columns:
         combined_internal["customer_id"] = None
+    
+    # Fetch event types from obligations API and map markers to actual API event type names
+    validation_api_key = api_key if api_key else API_KEY
+    if validation_api_key and validation_api_key.strip():
+        # Get unique customer IDs that have been set
+        unique_customer_ids = combined_internal["customer_id"].dropna().unique()
+        unique_customer_ids = [str(cid).strip() for cid in unique_customer_ids if str(cid).strip()]
+        
+        if len(unique_customer_ids) > 0:
+            # Fetch event types from obligations for all customers
+            customer_event_types = build_customer_event_type_mapping(unique_customer_ids, validation_api_key, use_obligations=True)
+            
+            if customer_event_types:
+                # Create mapping from our markers to actual API event type names
+                # For each customer, map __APP__/__UNIT__ to their actual event type names
+                def map_event_type_marker(row):
+                    customer_id = str(row.get("customer_id", "")).strip()
+                    current_event_type = str(row.get("event_type_name", "")).strip()
+                    application_type = str(row.get("ApplicationTypeName", "")).strip()
+                    
+                    if not customer_id or customer_id == "nan" or customer_id not in customer_event_types:
+                        # No mapping available, return current value
+                        return current_event_type
+                    
+                    valid_event_types = customer_event_types[customer_id]
+                    
+                    # Normalize event type names for matching (case-insensitive)
+                    valid_event_types_lower = [et.lower() for et in valid_event_types]
+                    
+                    # Map markers to actual API event type names based on application type
+                    if application_type == "Income":
+                        if current_event_type == "__APP__":
+                            # Find app-related event type
+                            for et in valid_event_types:
+                                et_lower = et.lower()
+                                if "app" in et_lower or "application" in et_lower or "per application" in et_lower:
+                                    return et
+                            # Fallback: use first event type if no match
+                            return valid_event_types[0] if valid_event_types else current_event_type
+                        elif current_event_type == "__UNIT__":
+                            # Find unit-related event type
+                            for et in valid_event_types:
+                                et_lower = et.lower()
+                                if "unit" in et_lower or "units" in et_lower:
+                                    return et
+                            # Fallback: use last event type if no match
+                            return valid_event_types[-1] if valid_event_types else current_event_type
+                    elif application_type == "LBPA":
+                        if current_event_type == "__LBPA_UNIT__":
+                            # Find LBPA unit-related event type
+                            for et in valid_event_types:
+                                et_lower = et.lower()
+                                if ("lbpa" in et_lower or "loanbeam" in et_lower) and ("unit" in et_lower or "units" in et_lower):
+                                    return et
+                            # Fallback: find any LBPA event type
+                            for et in valid_event_types:
+                                et_lower = et.lower()
+                                if "lbpa" in et_lower or "loanbeam" in et_lower:
+                                    return et
+                            # Fallback: use first event type if no match
+                            return valid_event_types[0] if valid_event_types else current_event_type
+                    elif application_type == "NQM":
+                        if current_event_type == "__NQM_APP__":
+                            # Find NQM app-related event type
+                            for et in valid_event_types:
+                                et_lower = et.lower()
+                                if "nqm" in et_lower and ("app" in et_lower or "application" in et_lower):
+                                    return et
+                            # Fallback: use first event type if no match
+                            return valid_event_types[0] if valid_event_types else current_event_type
+                        elif current_event_type == "__NQM_UNIT__":
+                            # Find NQM unit-related event type
+                            for et in valid_event_types:
+                                et_lower = et.lower()
+                                if "nqm" in et_lower and ("unit" in et_lower or "units" in et_lower):
+                                    return et
+                            # Fallback: use last event type if no match
+                            return valid_event_types[-1] if valid_event_types else current_event_type
+                    
+                    # If marker not recognized, return current value
+                    return current_event_type
+                
+                # Apply mapping to replace markers with actual API event type names
+                combined_internal["event_type_name"] = combined_internal.apply(map_event_type_marker, axis=1)
     
     # Map customer_id using account_id from customer file (primary method)
     if "account_id" in combined_internal.columns:
@@ -2357,6 +2492,88 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
                 combined_internal.loc[finastra_mask, "customer_id"] = finastra_customer_id_from_file
     
     valid_customer_mask = combined_internal["customer_id"].notna()
+    
+    # Fetch event types from obligations API and map markers to actual API event type names
+    # This must happen AFTER customer_id is set
+    validation_api_key = api_key if api_key else API_KEY
+    if validation_api_key and validation_api_key.strip():
+        # Get unique customer IDs that have been set
+        unique_customer_ids = combined_internal["customer_id"].dropna().unique()
+        unique_customer_ids = [str(cid).strip() for cid in unique_customer_ids if str(cid).strip()]
+        
+        if len(unique_customer_ids) > 0:
+            # Fetch event types from obligations for all customers
+            customer_event_types = build_customer_event_type_mapping(unique_customer_ids, validation_api_key, use_obligations=True)
+            
+            if customer_event_types:
+                # Create mapping from our markers to actual API event type names
+                # For each customer, map __APP__/__UNIT__ to their actual event type names
+                def map_event_type_marker(row):
+                    customer_id = str(row.get("customer_id", "")).strip()
+                    current_event_type = str(row.get("event_type_name", "")).strip()
+                    application_type = str(row.get("ApplicationTypeName", "")).strip()
+                    
+                    if not customer_id or customer_id == "nan" or customer_id not in customer_event_types:
+                        # No mapping available, return current value
+                        return current_event_type
+                    
+                    valid_event_types = customer_event_types[customer_id]
+                    
+                    # Map markers to actual API event type names based on application type
+                    if application_type == "Income":
+                        if current_event_type == "__APP__":
+                            # Find app-related event type
+                            for et in valid_event_types:
+                                et_lower = et.lower()
+                                if "app" in et_lower or "application" in et_lower or "per application" in et_lower:
+                                    return et
+                            # Fallback: use first event type if no match
+                            return valid_event_types[0] if valid_event_types else current_event_type
+                        elif current_event_type == "__UNIT__":
+                            # Find unit-related event type
+                            for et in valid_event_types:
+                                et_lower = et.lower()
+                                if "unit" in et_lower or "units" in et_lower:
+                                    return et
+                            # Fallback: use last event type if no match
+                            return valid_event_types[-1] if valid_event_types else current_event_type
+                    elif application_type == "LBPA":
+                        if current_event_type == "__LBPA_UNIT__":
+                            # Find LBPA unit-related event type
+                            for et in valid_event_types:
+                                et_lower = et.lower()
+                                if ("lbpa" in et_lower or "loanbeam" in et_lower) and ("unit" in et_lower or "units" in et_lower):
+                                    return et
+                            # Fallback: find any LBPA event type
+                            for et in valid_event_types:
+                                et_lower = et.lower()
+                                if "lbpa" in et_lower or "loanbeam" in et_lower:
+                                    return et
+                            # Fallback: use first event type if no match
+                            return valid_event_types[0] if valid_event_types else current_event_type
+                    elif application_type == "NQM":
+                        if current_event_type == "__NQM_APP__":
+                            # Find NQM app-related event type
+                            for et in valid_event_types:
+                                et_lower = et.lower()
+                                if "nqm" in et_lower and ("app" in et_lower or "application" in et_lower):
+                                    return et
+                            # Fallback: use first event type if no match
+                            return valid_event_types[0] if valid_event_types else current_event_type
+                        elif current_event_type == "__NQM_UNIT__":
+                            # Find NQM unit-related event type
+                            for et in valid_event_types:
+                                et_lower = et.lower()
+                                if "nqm" in et_lower and ("unit" in et_lower or "units" in et_lower):
+                                    return et
+                            # Fallback: use last event type if no match
+                            return valid_event_types[-1] if valid_event_types else current_event_type
+                    
+                    # If marker not recognized, return current value
+                    return current_event_type
+                
+                # Apply mapping to replace markers with actual API event type names
+                combined_internal["event_type_name"] = combined_internal.apply(map_event_type_marker, axis=1)
     
     # NOW calculate sums AFTER customer_id resolution
     # Sum UnitsAsPerSubmission and IsInitialSubmission directly from Income and LBPA files per customer_id
@@ -2604,6 +2821,87 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
         (combined_internal["differentiator"].astype(str).str.strip() == "")
     )
     combined_internal.loc[non_special_mask, "differentiator"] = ""
+    
+    # Fetch event types from obligations API and map markers to actual API event type names
+    validation_api_key = api_key if api_key else API_KEY
+    if validation_api_key and validation_api_key.strip():
+        # Get unique customer IDs that have been set
+        unique_customer_ids = combined_internal["customer_id"].dropna().unique()
+        unique_customer_ids = [str(cid).strip() for cid in unique_customer_ids if str(cid).strip()]
+        
+        if len(unique_customer_ids) > 0:
+            # Fetch event types from obligations for all customers
+            customer_event_types = build_customer_event_type_mapping(unique_customer_ids, validation_api_key, use_obligations=True)
+            
+            if customer_event_types:
+                # Create mapping from our markers to actual API event type names
+                # For each customer, map __APP__/__UNIT__ to their actual event type names
+                def map_event_type_marker(row):
+                    customer_id = str(row.get("customer_id", "")).strip()
+                    current_event_type = str(row.get("event_type_name", "")).strip()
+                    application_type = str(row.get("ApplicationTypeName", "")).strip()
+                    
+                    if not customer_id or customer_id == "nan" or customer_id not in customer_event_types:
+                        # No mapping available, return current value
+                        return current_event_type
+                    
+                    valid_event_types = customer_event_types[customer_id]
+                    
+                    # Map markers to actual API event type names based on application type
+                    if application_type == "Income":
+                        if current_event_type == "__APP__":
+                            # Find app-related event type
+                            for et in valid_event_types:
+                                et_lower = et.lower()
+                                if "app" in et_lower or "application" in et_lower or "per application" in et_lower:
+                                    return et
+                            # Fallback: use first event type if no match
+                            return valid_event_types[0] if valid_event_types else current_event_type
+                        elif current_event_type == "__UNIT__":
+                            # Find unit-related event type
+                            for et in valid_event_types:
+                                et_lower = et.lower()
+                                if "unit" in et_lower or "units" in et_lower:
+                                    return et
+                            # Fallback: use last event type if no match
+                            return valid_event_types[-1] if valid_event_types else current_event_type
+                    elif application_type == "LBPA":
+                        if current_event_type == "__LBPA_UNIT__":
+                            # Find LBPA unit-related event type
+                            for et in valid_event_types:
+                                et_lower = et.lower()
+                                if ("lbpa" in et_lower or "loanbeam" in et_lower) and ("unit" in et_lower or "units" in et_lower):
+                                    return et
+                            # Fallback: find any LBPA event type
+                            for et in valid_event_types:
+                                et_lower = et.lower()
+                                if "lbpa" in et_lower or "loanbeam" in et_lower:
+                                    return et
+                            # Fallback: use first event type if no match
+                            return valid_event_types[0] if valid_event_types else current_event_type
+                    elif application_type == "NQM":
+                        if current_event_type == "__NQM_APP__":
+                            # Find NQM app-related event type
+                            for et in valid_event_types:
+                                et_lower = et.lower()
+                                if "nqm" in et_lower and ("app" in et_lower or "application" in et_lower):
+                                    return et
+                            # Fallback: use first event type if no match
+                            return valid_event_types[0] if valid_event_types else current_event_type
+                        elif current_event_type == "__NQM_UNIT__":
+                            # Find NQM unit-related event type
+                            for et in valid_event_types:
+                                et_lower = et.lower()
+                                if "nqm" in et_lower and ("unit" in et_lower or "units" in et_lower):
+                                    return et
+                            # Fallback: use last event type if no match
+                            return valid_event_types[-1] if valid_event_types else current_event_type
+                    
+                    # If marker not recognized, return current value
+                    return current_event_type
+                
+                # Apply mapping to replace markers with actual API event type names
+                combined_internal["event_type_name"] = combined_internal.apply(map_event_type_marker, axis=1)
     
     # Initialize invoice column
     combined_internal["invoice"] = ""
@@ -3012,12 +3310,13 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
     # Store original dataframes for later split CSV generation with all columns
     st.session_state["original_income_df"] = income_df.copy()
     st.session_state["original_lbpa_df"] = lbpa_df.copy()
+    st.session_state["original_nqm_df"] = nqm_df.copy()
     
     return income_upload, lbpa_df, combined_csv_bytes, combined_internal_csv_bytes
 
 
-def generate_split_csvs_with_all_columns(income_df, lbpa_df, usage_df):
-    """Generate split CSVs with all original columns from Income and LBPA files, grouped by customer_id.
+def generate_split_csvs_with_all_columns(income_df, lbpa_df, usage_df, nqm_df):
+    """Generate split CSVs with all original columns from Income, LBPA, and NQM files, grouped by customer_id.
     Uses the Usage CSV (which has customer_id) to join back to original dataframes."""
     
     # Extract customer_id mapping from usage_df
@@ -3088,12 +3387,13 @@ def generate_split_csvs_with_all_columns(income_df, lbpa_df, usage_df):
         
         return df
     
-    # Add customer_id to both dataframes using the usage mapping
+    # Add customer_id to all dataframes using the usage mapping
     income_with_id = add_customer_id_from_usage(income_df, "income")
     lbpa_with_id = add_customer_id_from_usage(lbpa_df, "lbpa")
     
-    # Combine both dataframes
-    combined_all = pd.concat([income_with_id, lbpa_with_id], ignore_index=True)
+    # Combine all dataframes
+    nqm_with_id = add_customer_id_from_usage(nqm_df, "nqm")
+    combined_all = pd.concat([income_with_id, lbpa_with_id, nqm_with_id], ignore_index=True)
     
     # Generate split CSVs grouped by customer_id
     results = []
@@ -3194,7 +3494,7 @@ with usage_tab:
         
         # File type selectors
         st.markdown("**Assign file types:**")
-        col1, col2, col3 = st.columns(3)
+        col1, col2, col3, col4 = st.columns(4)
         
         with col1:
             income_file_name = st.selectbox(
@@ -3213,6 +3513,14 @@ with usage_tab:
             )
         
         with col3:
+            nqm_file_name = st.selectbox(
+                "NQM File",
+                options=[""] + file_names,
+                key="nqm_file_selector",
+                help="Select which file contains NQM transaction data"
+            )
+        
+        with col4:
             customer_file_name = st.selectbox(
                 "Customer File",
                 options=[""] + file_names,
@@ -3225,6 +3533,8 @@ with usage_tab:
             st.session_state["file_assignments"]["income"] = income_file_name
         if lbpa_file_name:
             st.session_state["file_assignments"]["lbpa"] = lbpa_file_name
+        if nqm_file_name:
+            st.session_state["file_assignments"]["nqm"] = nqm_file_name
         if customer_file_name:
             st.session_state["file_assignments"]["customer"] = customer_file_name
         
@@ -3234,6 +3544,8 @@ with usage_tab:
                 persist_upload(uploaded_file, "income")
             if lbpa_file_name and uploaded_file.name == lbpa_file_name:
                 persist_upload(uploaded_file, "lbpa")
+            if nqm_file_name and uploaded_file.name == nqm_file_name:
+                persist_upload(uploaded_file, "nqm")
             if customer_file_name and uploaded_file.name == customer_file_name:
                 persist_upload(uploaded_file, "customer")
     
@@ -3259,6 +3571,16 @@ with usage_tab:
                 st.dataframe(lbpa_df, use_container_width=True)
             except Exception as e:
                 st.error(f"Could not preview LBPA file: {e}")
+    
+    if uploaded_files.get("nqm", {}).get("bytes"):
+        st.markdown("**NQM File Preview:**")
+        with st.expander("Preview NQM File", expanded=False):
+            try:
+                nqm_df = pd.read_csv(BytesIO(uploaded_files["nqm"]["bytes"]))
+                st.caption(f"Rows: {len(nqm_df):,} | Columns: {len(nqm_df.columns)}")
+                st.dataframe(nqm_df, use_container_width=True)
+            except Exception as e:
+                st.error(f"Could not preview NQM file: {e}")
     
     if uploaded_files.get("customer", {}).get("bytes"):
         st.markdown("**Customer File Preview:**")
@@ -3347,6 +3669,8 @@ with usage_tab:
             missing.append("Income")
         if not up.get("lbpa", {}).get("bytes"):
             missing.append("LBPA")
+        if not up.get("nqm", {}).get("bytes"):
+            missing.append("NQM")
         if not up.get("customer", {}).get("bytes"):
             missing.append("Customer File")
 
@@ -3364,6 +3688,7 @@ with usage_tab:
                         BytesIO(up["income"]["bytes"]),
                         BytesIO(up["lbpa"]["bytes"]),
                         uploaded_customer,
+                        uploaded_nqm=BytesIO(up["nqm"]["bytes"]),
                         uploaded_clients=None,
                         resolve_now=True,  # Always enabled - AccountIDs will be set if API key is provided
                         usage_date=usage_date,
@@ -3460,16 +3785,25 @@ with chunk_tab:
                 # Get original Income and LBPA data from session state
                 uploaded_files_check = st.session_state.get("uploaded_files", {})
                 
-                if not uploaded_files_check.get("income", {}).get("bytes") or not uploaded_files_check.get("lbpa", {}).get("bytes"):
-                    st.warning("⚠️ Original Income/LBPA data not found. Please generate Usage CSV in the 'Usage Transformation' tab first.")
+                if not uploaded_files_check.get("income", {}).get("bytes") or not uploaded_files_check.get("lbpa", {}).get("bytes") or not uploaded_files_check.get("nqm", {}).get("bytes"):
+                    st.warning("⚠️ Original Income/LBPA/NQM data not found. Please generate Usage CSV in the 'Usage Transformation' tab first.")
                 else:
                     # Read the generated usage CSV to get customer mappings
                     usage_csv_bytes = generated_files["usage_combined"]["bytes"]
                     usage_df = pd.read_csv(BytesIO(usage_csv_bytes))
                     
-                    # Read original Income and LBPA files
-                    income_df = pd.read_csv(BytesIO(uploaded_files_check["income"]["bytes"]))
-                    lbpa_df = pd.read_csv(BytesIO(uploaded_files_check["lbpa"]["bytes"]))
+                    # Use stored original dataframes if available, otherwise read from uploaded files
+                    income_df = st.session_state.get("original_income_df", None)
+                    if income_df is None:
+                        income_df = pd.read_csv(BytesIO(uploaded_files_check["income"]["bytes"]))
+                    
+                    lbpa_df = st.session_state.get("original_lbpa_df", None)
+                    if lbpa_df is None:
+                        lbpa_df = pd.read_csv(BytesIO(uploaded_files_check["lbpa"]["bytes"]))
+                    
+                    nqm_df = st.session_state.get("original_nqm_df", None)
+                    if nqm_df is None:
+                        nqm_df = pd.read_csv(BytesIO(uploaded_files_check["nqm"]["bytes"]))
                     
                     # Show download buttons if split CSVs already exist
                     if st.session_state.get("split_csvs_ready"):
@@ -3555,7 +3889,8 @@ with chunk_tab:
                         st.markdown("---")
                         if st.button("Generate Split CSVs", type="primary"):
                             with st.spinner("Generating split CSVs..."):
-                                split_csvs = generate_split_csvs_with_all_columns(income_df, lbpa_df, usage_df)
+                                nqm_df = st.session_state.get("original_nqm_df")
+                                split_csvs = generate_split_csvs_with_all_columns(income_df, lbpa_df, usage_df, nqm_df)
                             
                             if split_csvs:
                                 st.session_state["invoice_split_csvs"] = split_csvs

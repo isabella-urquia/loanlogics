@@ -8,10 +8,12 @@ import hashlib
 import textwrap
 import uuid
 import warnings
+import json
 from collections import Counter
 from io import BytesIO
-from datetime import datetime
+from datetime import datetime, timedelta
 from fpdf import FPDF  # fpdf2 package uses 'from fpdf import FPDF'
+from streamlit_cookies_manager import EncryptedCookieManager
 
 # ============ CONFIG ============
 OUTPUT_DIR = "usage_uploads"
@@ -26,6 +28,18 @@ API_URL_BASE = "https://integrators.prod.api.tabsplatform.com/v3/customers"
 API_INVOICES_URL = "https://integrators.prod.api.tabsplatform.com/v3/invoices"
 NETSUITE_API_BASE = "https://integrators.prod.api.tabsplatform.com"
 # =================================
+
+# Initialize cookie manager for persistent storage (7-day expiration)
+@st.cache_resource
+def get_cookie_manager():
+    """Initialize and return the encrypted cookie manager"""
+    cookies = EncryptedCookieManager(prefix="loanlogics_")
+    if not cookies.ready():
+        cookies.load()
+    return cookies
+
+# Cookie expiration: 7 days
+COOKIE_EXPIRATION_DAYS = 7
 
 # Initialize session state variables
 if "show_usage_download" not in st.session_state:
@@ -757,7 +771,9 @@ def fetch_all_invoices_for_cache(api_token):
                     st.warning("⚠️ Reached maximum page limit (100), stopping pagination")
                     break
             else:
-                st.error(f"API call failed with status {response.status_code}")
+                st.error(f"❌ API call failed with status {response.status_code}")
+                if response.status_code == 403:
+                    st.warning("💡 Status 403 (Forbidden) - Your API key may not have permission to access this resource.")
                 break
         
         # Clear progress indicators
@@ -770,18 +786,22 @@ def fetch_all_invoices_for_cache(api_token):
             st.session_state[cache_key] = all_invoices
             st.session_state[f"{cache_key}_timestamp"] = datetime.now().isoformat()
             
-            # Also save to persistent file
+            # Also save to persistent cookies
             try:
-                import json
-                cache_file = os.path.join(_CACHE_DIR, f"invoice_cache_{api_token[:10]}.json")
-                os.makedirs(_CACHE_DIR, exist_ok=True)
-                with open(cache_file, 'w') as f:
-                    json.dump({
+                cookies = _get_cookie_manager()
+                if cookies:
+                    cache_data = {
                         'invoices': all_invoices,
                         'timestamp': datetime.now().isoformat()
-                    }, f)
+                    }
+                    cache_json = json.dumps(cache_data, ensure_ascii=False)
+                    cache_key = f"invoice_cache_{api_token[:10]}"
+                    # Set cookie with 7-day expiration (in seconds)
+                    max_age_seconds = COOKIE_EXPIRATION_DAYS * 24 * 60 * 60
+                    cookies.set(cache_key, cache_json, max_age=max_age_seconds)
+                    cookies.save()
             except Exception as e:
-                st.warning(f"Could not save cache to file: {str(e)}")
+                st.warning(f"Could not save cache to cookies: {str(e)}")
             
             st.success(f"✅ Successfully fetched and cached {len(all_invoices)} invoices across {page} pages")
             return all_invoices
@@ -820,23 +840,21 @@ def find_invoice_by_date(customer_id, issue_date, api_token):
         cache_key = f"invoice_cache_{api_token[:10]}"
         cached_invoices = st.session_state.get(cache_key, [])
         
-        # If no cache in session state, try to load from persistent file
+        # If no cache in session state, try to load from persistent cookies
         if not cached_invoices:
             try:
-                import json
-                # Ensure cache directory exists
-                os.makedirs(_CACHE_DIR, exist_ok=True)
-                cache_file = os.path.join(_CACHE_DIR, f"invoice_cache_{api_token[:10]}.json")
-                if os.path.exists(cache_file):
-                    with open(cache_file, 'r') as f:
-                        cache_data = json.load(f)
+                cookies = _get_cookie_manager()
+                if cookies:
+                    cookie_cache_data = cookies.get(cache_key)
+                    if cookie_cache_data:
+                        cache_data = json.loads(cookie_cache_data)
                         cached_invoices = cache_data.get('invoices', [])
                         
-                        # Always restore to session state if we loaded from file
+                        # Always restore to session state if we loaded from cookies
                         if cached_invoices:
                             st.session_state[cache_key] = cached_invoices
             except Exception as e:
-                # Silently fail - cache file might be corrupted
+                # Silently fail - cache cookie might be corrupted
                 pass
         
         if cached_invoices:
@@ -910,82 +928,87 @@ if "generated_files" not in st.session_state:
     
     
 
-# -------- Persistent cache helpers (avoid re-calling API across sessions) --------
-# We persist the NetSuite→Tabs ID cache to disk and hydrate it at startup.
-_CACHE_DIR = os.path.join(OUTPUT_DIR, "_session")
-_NS_CACHE_FILE = os.path.join(_CACHE_DIR, "ns_to_tabs_cache.json")
-# Try repo root first (for deployment), then fall back to cache dir
-_CLIENT_MAPPINGS_FILE_REPO = os.path.join(os.path.dirname(__file__), "client_mappings.json")
-_CLIENT_MAPPINGS_FILE = os.path.join(_CACHE_DIR, "client_mappings.json")
+# -------- Persistent cache helpers using cookies (7-day expiration) --------
+# We persist the NetSuite→Tabs ID cache to cookies and hydrate it at startup.
 
-def _ensure_cache_dir_exists() -> None:
+def _get_cookie_manager():
+    """Get the cookie manager instance"""
     try:
-        os.makedirs(_CACHE_DIR, exist_ok=True)
+        cookies = get_cookie_manager()
+        if not cookies.ready():
+            cookies.load()
+        return cookies
     except Exception:
-        pass
+        return None
 
-def _load_ns_cache_from_disk() -> dict:
+def _load_ns_cache_from_cookies() -> dict:
+    """Load NetSuite to Tabs cache from cookies"""
     try:
-        if os.path.exists(_NS_CACHE_FILE):
-            import json
-            with open(_NS_CACHE_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
+        cookies = _get_cookie_manager()
+        if cookies:
+            cache_data = cookies.get("ns_to_tabs_cache")
+            if cache_data:
+                data = json.loads(cache_data)
                 if isinstance(data, dict):
                     return {str(k): str(v) for k, v in data.items()}
     except Exception:
         pass
     return {}
 
-def _save_ns_cache_to_disk(cache: dict) -> None:
+def _save_ns_cache_to_cookies(cache: dict) -> None:
+    """Save NetSuite to Tabs cache to cookies with 7-day expiration"""
     try:
-        _ensure_cache_dir_exists()
-        import json
-        with open(_NS_CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(cache, f, ensure_ascii=False)
+        cookies = _get_cookie_manager()
+        if cookies:
+            cache_json = json.dumps(cache, ensure_ascii=False)
+            # Set cookie with 7-day expiration (in seconds)
+            max_age_seconds = COOKIE_EXPIRATION_DAYS * 24 * 60 * 60
+            cookies.set("ns_to_tabs_cache", cache_json, max_age=max_age_seconds)
+            cookies.save()
     except Exception:
         pass
 
-def _load_client_mappings_from_disk() -> dict:
-    """Load client mappings (parent_to_id, acct_to_tabs_id, etc.) from disk
-    Tries repo root first (for deployment), then cache directory
-    """
-    import json
-    # Try repo root first (for Streamlit Cloud deployment)
-    for file_path in [_CLIENT_MAPPINGS_FILE_REPO, _CLIENT_MAPPINGS_FILE]:
-        try:
-            if os.path.exists(file_path):
-                with open(file_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    if isinstance(data, dict):
-                        return {
-                            "parent_to_id": {str(k): str(v) for k, v in data.get("parent_to_id", {}).items()},
-                            "acct_to_tabs_id": {str(k): str(v) for k, v in data.get("acct_to_tabs_id", {}).items()},
-                            "acct_to_ns_id": {str(k): str(v) for k, v in data.get("acct_to_ns_id", {}).items()},
-                            "acct_to_income_evt": {str(k): str(v) for k, v in data.get("acct_to_income_evt", {}).items()},
-                            "acct_to_lbpa_evt": {str(k): str(v) for k, v in data.get("acct_to_lbpa_evt", {}).items()},
-                            "acct_to_diff_name": {str(k): str(v) for k, v in data.get("acct_to_diff_name", {}).items()},
-                            "acct_to_base_name": {str(k): str(v) for k, v in data.get("acct_to_base_name", {}).items()},
-                        }
-        except Exception:
-            continue
+def _load_client_mappings_from_cookies() -> dict:
+    """Load client mappings (parent_to_id, acct_to_tabs_id, etc.) from cookies"""
+    try:
+        cookies = _get_cookie_manager()
+        if cookies:
+            mappings_data = cookies.get("client_mappings")
+            if mappings_data:
+                data = json.loads(mappings_data)
+                if isinstance(data, dict):
+                    return {
+                        "parent_to_id": {str(k): str(v) for k, v in data.get("parent_to_id", {}).items()},
+                        "acct_to_tabs_id": {str(k): str(v) for k, v in data.get("acct_to_tabs_id", {}).items()},
+                        "acct_to_ns_id": {str(k): str(v) for k, v in data.get("acct_to_ns_id", {}).items()},
+                        "acct_to_income_evt": {str(k): str(v) for k, v in data.get("acct_to_income_evt", {}).items()},
+                        "acct_to_lbpa_evt": {str(k): str(v) for k, v in data.get("acct_to_lbpa_evt", {}).items()},
+                        "acct_to_diff_name": {str(k): str(v) for k, v in data.get("acct_to_diff_name", {}).items()},
+                        "acct_to_base_name": {str(k): str(v) for k, v in data.get("acct_to_base_name", {}).items()},
+                    }
+    except Exception:
+        pass
     return {}
 
-def _save_client_mappings_to_disk(mappings: dict) -> None:
-    """Save client mappings to disk"""
+def _save_client_mappings_to_cookies(mappings: dict) -> None:
+    """Save client mappings to cookies with 7-day expiration"""
     try:
-        _ensure_cache_dir_exists()
-        import json
-        with open(_CLIENT_MAPPINGS_FILE, "w", encoding="utf-8") as f:
-            json.dump(mappings, f, ensure_ascii=False)
+        cookies = _get_cookie_manager()
+        if cookies:
+            mappings_json = json.dumps(mappings, ensure_ascii=False)
+            # Set cookie with 7-day expiration (in seconds)
+            max_age_seconds = COOKIE_EXPIRATION_DAYS * 24 * 60 * 60
+            cookies.set("client_mappings", mappings_json, max_age=max_age_seconds)
+            cookies.save()
     except Exception:
         pass
 
-# Hydrate session cache from disk once
+# Hydrate session cache from cookies once
 try:
-    disk_cache = _load_ns_cache_from_disk()
-    if disk_cache:
-        # Merge; keep existing session entries, add new ones from disk
-        st.session_state["ns_to_tabs_cache"] = {**disk_cache, **st.session_state.get("ns_to_tabs_cache", {})}
+    cookie_cache = _load_ns_cache_from_cookies()
+    if cookie_cache:
+        # Merge; keep existing session entries, add new ones from cookies
+        st.session_state["ns_to_tabs_cache"] = {**cookie_cache, **st.session_state.get("ns_to_tabs_cache", {})}
 except Exception:
     pass
 
@@ -1031,12 +1054,12 @@ def persist_upload(uploaded_file, key: str) -> None:
         except Exception:
             pass
 
-# Load client mappings from disk at startup
+# Load client mappings from cookies at startup
 try:
     if "client_mappings_loaded" not in st.session_state:
-        disk_mappings = _load_client_mappings_from_disk()
-        if disk_mappings:
-            st.session_state["client_mappings"] = disk_mappings
+        cookie_mappings = _load_client_mappings_from_cookies()
+        if cookie_mappings:
+            st.session_state["client_mappings"] = cookie_mappings
             st.session_state["client_mappings_loaded"] = True
         else:
             st.session_state["client_mappings"] = {}
@@ -1667,8 +1690,8 @@ def resolve_tabs_id_from_ns(ns_external_id: str) -> str | None:
                     if tabs_id:
                         cache[ns_external_id] = tabs_id
                         st.session_state["ns_to_tabs_cache"] = cache
-                        # Persist to disk
-                        _save_ns_cache_to_disk(cache)
+                        # Persist to cookies
+                        _save_ns_cache_to_cookies(cache)
                         # Sync Customer Number custom field from entityId if available
                         sync_customer_number_from_entity_id(cust)
                         return tabs_id
@@ -1678,8 +1701,8 @@ def resolve_tabs_id_from_ns(ns_external_id: str) -> str | None:
             if tabs_id:
                 cache[ns_external_id] = tabs_id
                 st.session_state["ns_to_tabs_cache"] = cache
-                # Persist to disk
-                _save_ns_cache_to_disk(cache)
+                # Persist to cookies
+                _save_ns_cache_to_cookies(cache)
                 # Sync Customer Number custom field from entityId if available
                 sync_customer_number_from_entity_id(cust)
                 return tabs_id
@@ -1822,8 +1845,8 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
     elif uploaded_clients:
         # Extract mappings from clients file
         mappings = extract_mappings_from_clients(uploaded_clients)
-        # Save to disk for future use
-        _save_client_mappings_to_disk(mappings)
+        # Save to cookies for future use
+        _save_client_mappings_to_cookies(mappings)
         parent_to_id = mappings.get("parent_to_id", {})
         acct_to_tabs_id = mappings.get("acct_to_tabs_id", {})
         acct_to_ns_id = mappings.get("acct_to_ns_id", {})
@@ -1833,8 +1856,8 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
         acct_to_diff_name = mappings.get("acct_to_diff_name", {})
         acct_to_base_name = mappings.get("acct_to_base_name", {})
     else:
-        # Try to load from disk
-        mappings = _load_client_mappings_from_disk()
+        # Try to load from cookies
+        mappings = _load_client_mappings_from_cookies()
         if mappings:
             parent_to_id = mappings.get("parent_to_id", {})
             acct_to_tabs_id = mappings.get("acct_to_tabs_id", {})
@@ -1853,10 +1876,6 @@ def transform_usage(uploaded_income, uploaded_lbpa, uploaded_customer, uploaded_
             acct_to_nqm_evt = {}
             acct_to_diff_name = {}
             acct_to_base_name = {}
-            try:
-                st.warning("No client mappings found. Proceeding without customer_id mapping.")
-            except Exception:
-                pass
 
     # Helper function to extract AccountID from CustomerNumber (handles floats like 8602.0 -> 8602)
     # Must be defined before process_usage since process_usage uses it
@@ -3617,14 +3636,14 @@ with usage_tab:
             except Exception as e:
                 st.error(f"Could not preview Customer file: {e}")
 
-    # Client mappings are automatically loaded from disk at startup
+    # Client mappings are automatically loaded from cookies at startup
     current_mappings = st.session_state.get("client_mappings", {})
     if not current_mappings:
-        # Try to load from disk if not in session state
-        disk_mappings = _load_client_mappings_from_disk()
-        if disk_mappings:
-            st.session_state["client_mappings"] = disk_mappings
-            current_mappings = disk_mappings
+        # Try to load from cookies if not in session state
+        cookie_mappings = _load_client_mappings_from_cookies()
+        if cookie_mappings:
+            st.session_state["client_mappings"] = cookie_mappings
+            current_mappings = cookie_mappings
 
     # Split invoice configuration
     st.markdown("---")
@@ -4005,24 +4024,23 @@ with chunk_tab:
             cached_invoices = st.session_state.get(cache_key, [])
             cache_timestamp = st.session_state.get(f"{cache_key}_timestamp", None)
             
-            # If no cache in session state, try to load from file
+            # If no cache in session state, try to load from cookies
             if not cached_invoices:
                 try:
-                    import json
-                    cache_file = os.path.join(_CACHE_DIR, f"invoice_cache_{api_key_attach[:10]}.json")
-                    os.makedirs(_CACHE_DIR, exist_ok=True)
-                    if os.path.exists(cache_file):
-                        with open(cache_file, 'r') as f:
-                            cache_data = json.load(f)
+                    cookies = _get_cookie_manager()
+                    if cookies:
+                        cookie_cache_data = cookies.get(cache_key)
+                        if cookie_cache_data:
+                            cache_data = json.loads(cookie_cache_data)
                             cached_invoices = cache_data.get('invoices', [])
                             cache_timestamp_str = cache_data.get('timestamp')
                             if cache_timestamp_str:
                                 cache_timestamp = datetime.fromisoformat(cache_timestamp_str)
-                        
-                        # Restore to session state
-                        st.session_state[cache_key] = cached_invoices
-                        st.session_state[f"{cache_key}_timestamp"] = cache_timestamp
-                        st.success(f"✅ Loaded {len(cached_invoices)} invoices from persistent cache")
+                            
+                            # Restore to session state
+                            st.session_state[cache_key] = cached_invoices
+                            st.session_state[f"{cache_key}_timestamp"] = cache_timestamp
+                            st.success(f"✅ Loaded {len(cached_invoices)} invoices from persistent cache")
                 except Exception as e:
                     st.warning(f"Could not load persistent cache: {e}")
                     cached_invoices = []
@@ -4054,21 +4072,23 @@ with chunk_tab:
                                 st.session_state[cache_key] = all_invoices
                                 st.session_state[f"{cache_key}_timestamp"] = datetime.now()
                                 
-                                # Also save to file for persistence
+                                # Also save to cookies for persistence
                                 try:
-                                    import json
-                                    cache_file = os.path.join(_CACHE_DIR, f"invoice_cache_{api_key_attach[:10]}.json")
-                                    os.makedirs(_CACHE_DIR, exist_ok=True)
-                                    cache_data = {
-                                        'invoices': all_invoices,
-                                        'timestamp': datetime.now().isoformat(),
-                                        'count': len(all_invoices)
-                                    }
-                                    with open(cache_file, 'w') as f:
-                                        json.dump(cache_data, f)
-                                    st.success(f"✅ Cached {len(all_invoices)} invoices successfully! (Saved to file)")
+                                    cookies = _get_cookie_manager()
+                                    if cookies:
+                                        cache_data = {
+                                            'invoices': all_invoices,
+                                            'timestamp': datetime.now().isoformat(),
+                                            'count': len(all_invoices)
+                                        }
+                                        cache_json = json.dumps(cache_data, ensure_ascii=False)
+                                        # Set cookie with 7-day expiration (in seconds)
+                                        max_age_seconds = COOKIE_EXPIRATION_DAYS * 24 * 60 * 60
+                                        cookies.set(cache_key, cache_json, max_age=max_age_seconds)
+                                        cookies.save()
+                                        st.success(f"✅ Cached {len(all_invoices)} invoices successfully! (Saved to cookies)")
                                 except Exception as e:
-                                    st.success(f"✅ Cached {len(all_invoices)} invoices successfully! (File save failed: {e})")
+                                    st.success(f"✅ Cached {len(all_invoices)} invoices successfully! (Cookie save failed: {e})")
                                 
                                 st.rerun()
                             else:
@@ -4082,15 +4102,15 @@ with chunk_tab:
                     if f"{cache_key}_timestamp" in st.session_state:
                         del st.session_state[f"{cache_key}_timestamp"]
                     
-                    # Also clear from file
+                    # Also clear from cookies
                     try:
-                        cache_file = os.path.join(_CACHE_DIR, f"invoice_cache_{api_key_attach[:10]}.json")
-                        os.makedirs(_CACHE_DIR, exist_ok=True)
-                        if os.path.exists(cache_file):
-                            os.remove(cache_file)
-                        st.success("✅ Cache cleared! (Both memory and file)")
+                        cookies = _get_cookie_manager()
+                        if cookies:
+                            cookies.delete(cache_key)
+                            cookies.save()
+                        st.success("✅ Cache cleared! (Both memory and cookies)")
                     except Exception as e:
-                        st.success(f"✅ Cache cleared! (File removal failed: {e})")
+                        st.success(f"✅ Cache cleared! (Cookie removal failed: {e})")
                     
                     st.rerun()
             

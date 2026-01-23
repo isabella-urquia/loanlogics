@@ -3409,9 +3409,10 @@ def generate_split_csvs_with_all_columns(income_df, lbpa_df, usage_df, nqm_df):
         combined_all = combined_all.rename(columns={"__original_account_name__": "original_account_name"})
         if "original_account_name" not in columns_to_keep:
             columns_to_keep.append("original_account_name")
-    # Ensure customer_id is included
-    if "customer_id" not in columns_to_keep:
-        columns_to_keep.append("customer_id")
+    # Do NOT include customer_id in split CSVs - it will be extracted from filename for matching
+    # Remove customer_id from columns_to_keep if it exists
+    if "customer_id" in columns_to_keep:
+        columns_to_keep.remove("customer_id")
     
     for customer_id, group in combined_all.groupby("customer_id"):
         group = group.sort_values("SubmissionDate" if "SubmissionDate" in group.columns else group.columns[0])
@@ -3446,7 +3447,7 @@ def generate_split_csvs_with_all_columns(income_df, lbpa_df, usage_df, nqm_df):
         
         group_clean = group[ordered_cols]
         split_csv_bytes = group_clean.to_csv(index=False).encode("utf-8")
-        results.append({"name": filename, "bytes": split_csv_bytes})
+        results.append({"name": filename, "bytes": split_csv_bytes, "customer_id": str(customer_id)})
     return results
 
 def generate_chunks(combined_df, max_rows_per_chunk=900):
@@ -3823,8 +3824,7 @@ with chunk_tab:
                             csv_df = pd.read_csv(BytesIO(split_csv["bytes"]))
                             summary_data.append({
                                 "Filename": split_csv["name"],
-                                "Rows": len(csv_df),
-                                "Customer ID": csv_df["customer_id"].iloc[0] if "customer_id" in csv_df.columns and len(csv_df) > 0 else "N/A"
+                                "Rows": len(csv_df)
                             })
                         
                         summary_df = pd.DataFrame(summary_data)
@@ -3834,7 +3834,7 @@ with chunk_tab:
                         st.markdown("---")
                         col1, col2 = st.columns([3, 1])
                         with col1:
-                            search_term = st.text_input("Search split CSVs by filename or customer ID", 
+                            search_term = st.text_input("Search split CSVs by filename", 
                                                        placeholder="Type to filter...", 
                                                        key="search_split_csvs",
                                                        label_visibility="visible")
@@ -3862,8 +3862,7 @@ with chunk_tab:
                             search_lower = search_term.lower()
                             filtered_csvs = [
                                 csv for csv in split_csvs 
-                                if search_lower in csv["name"].lower() or 
-                                search_lower in str(summary_df[summary_df["Filename"] == csv["name"]]["Customer ID"].iloc[0] if len(summary_df[summary_df["Filename"] == csv["name"]]) > 0 else "").lower()
+                                if search_lower in csv["name"].lower()
                             ]
                         
                         # Add individual download buttons for each split CSV
@@ -3902,8 +3901,7 @@ with chunk_tab:
                                     csv_df = pd.read_csv(BytesIO(split_csv["bytes"]))
                                     summary_data.append({
                                         "Filename": split_csv["name"],
-                                        "Rows": len(csv_df),
-                                        "Customer ID": csv_df["customer_id"].iloc[0] if "customer_id" in csv_df.columns and len(csv_df) > 0 else "N/A"
+                                        "Rows": len(csv_df)
                                     })
                                 
                                 summary_df = pd.DataFrame(summary_data)
@@ -3942,8 +3940,7 @@ with chunk_tab:
                                     search_lower = search_term_new.lower()
                                     filtered_csvs_new = [
                                         csv for csv in split_csvs 
-                                        if search_lower in csv["name"].lower() or 
-                                        search_lower in str(summary_df[summary_df["Filename"] == csv["name"]]["Customer ID"].iloc[0] if len(summary_df[summary_df["Filename"] == csv["name"]]) > 0 else "").lower()
+                                        if search_lower in csv["name"].lower()
                                     ]
                                 
                                 # Add individual download buttons for each split CSV
@@ -4135,33 +4132,8 @@ with chunk_tab:
                         mapping_results = []
                         
                         for split_csv in split_csvs:
-                            csv_df = pd.read_csv(BytesIO(split_csv["bytes"]))
-                            customer_id = None
-                            
-                            # Try to get customer_id from the CSV
-                            if "customer_id" in csv_df.columns:
-                                customer_ids = csv_df["customer_id"].dropna().unique()
-                                # Validate: each split CSV must contain exactly one unique customer_id
-                                if len(customer_ids) == 0:
-                                    mapping_results.append({
-                                        "split_csv_filename": split_csv["name"],
-                                        "customer_id": "N/A",
-                                        "invoice_id": "Not Found",
-                                        "status": "Failed",
-                                        "reason": "No customer ID in CSV"
-                                    })
-                                    continue
-                                elif len(customer_ids) > 1:
-                                    mapping_results.append({
-                                        "split_csv_filename": split_csv["name"],
-                                        "customer_id": f"Multiple: {', '.join(map(str, customer_ids[:3]))}",
-                                        "invoice_id": "Not Found",
-                                        "status": "Failed",
-                                        "reason": f"CSV contains {len(customer_ids)} unique customer IDs (must be exactly 1)"
-                                    })
-                                    continue
-                                else:
-                                    customer_id = str(customer_ids[0]).strip()
+                            # Get customer_id from stored mapping (more efficient than parsing filename)
+                            customer_id = split_csv.get("customer_id")
                             
                             if not customer_id:
                                 mapping_results.append({
@@ -4169,7 +4141,7 @@ with chunk_tab:
                                     "customer_id": "N/A",
                                     "invoice_id": "Not Found",
                                     "status": "Failed",
-                                    "reason": "No customer ID in CSV"
+                                    "reason": "No customer ID found in split CSV metadata"
                                 })
                                 continue
                             
@@ -4297,25 +4269,11 @@ with chunk_tab:
                                     
                                     split_csv_bytes = split_csvs_dict[split_csv_name]["bytes"]
                                     
-                                    # Validate: each split CSV must contain exactly one unique customer_id
+                                    # Validation: customer_id is extracted from filename, not from CSV
+                                    # No need to validate customer_id in CSV since it's not included
                                     try:
                                         validation_df = pd.read_csv(BytesIO(split_csv_bytes))
-                                        if "customer_id" in validation_df.columns:
-                                            unique_customer_ids = validation_df["customer_id"].dropna().unique()
-                                            if len(unique_customer_ids) == 0:
-                                                upload_results.append({
-                                                    "split_csv": split_csv_name,
-                                                    "status": "Failed",
-                                                    "reason": "CSV contains no customer IDs"
-                                                })
-                                                continue
-                                            elif len(unique_customer_ids) > 1:
-                                                upload_results.append({
-                                                    "split_csv": split_csv_name,
-                                                    "status": "Failed",
-                                                    "reason": f"CSV contains {len(unique_customer_ids)} unique customer IDs (must be exactly 1): {', '.join(map(str, unique_customer_ids[:3]))}"
-                                                })
-                                                continue
+                                        # Just verify the CSV can be read - customer_id comes from filename
                                     except Exception as e:
                                         upload_results.append({
                                             "split_csv": split_csv_name,

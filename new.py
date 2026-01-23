@@ -3414,6 +3414,15 @@ def generate_split_csvs_with_all_columns(income_df, lbpa_df, usage_df, nqm_df):
     if "customer_id" in columns_to_keep:
         columns_to_keep.remove("customer_id")
     
+    # Remove BillingRate column from split CSVs (case-insensitive)
+    billing_rate_variations = ["BillingRate", "billingrate", "Billing Rate", "billing rate", "Billing_Rate"]
+    for col_name in billing_rate_variations:
+        if col_name in columns_to_keep:
+            columns_to_keep.remove(col_name)
+    
+    # Also check for any column containing "billing" and "rate" (case-insensitive)
+    columns_to_keep = [col for col in columns_to_keep if not (col.lower().find("billing") >= 0 and col.lower().find("rate") >= 0)]
+    
     for customer_id, group in combined_all.groupby("customer_id"):
         group = group.sort_values("SubmissionDate" if "SubmissionDate" in group.columns else group.columns[0])
         if pd.isna(customer_id) or str(customer_id).strip() == "":

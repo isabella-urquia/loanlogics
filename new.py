@@ -3455,6 +3455,11 @@ def generate_split_csvs_with_all_columns(income_df, lbpa_df, usage_df, nqm_df):
                 ordered_cols.append(col)
         
         group_clean = group[ordered_cols]
+        
+        # Rename IsInitialSubmission to TotalApps
+        if "IsInitialSubmission" in group_clean.columns:
+            group_clean = group_clean.rename(columns={"IsInitialSubmission": "TotalApps"})
+        
         split_csv_bytes = group_clean.to_csv(index=False).encode("utf-8")
         results.append({"name": filename, "bytes": split_csv_bytes, "customer_id": str(customer_id)})
     return results
